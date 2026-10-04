@@ -1,0 +1,103 @@
+@import 'tailwindcss';
+:root {
+  --background: #f7f8fa;
+  --foreground: #1c2230;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 14px;
+}
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+button {
+  cursor: pointer;
+}
+button:disabled {
+  cursor: not-allowed;
+}
+::selection {
+  background: #fed7aa;
+}
+input,
+select,
+textarea {
+  outline: none;
+}
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: #f97316 !important;
+  box-shadow: 0 0 0 3px #f9731618;
+}
+.card {
+  background: white;
+  border: 1px solid #e5e7ed;
+  border-radius: 12px;
+}
+.field {
+  width: 100%;
+  border: 1px solid #dfe3ea;
+  border-radius: 7px;
+  background: white;
+  padding: 10px 12px;
+}
+.label {
+  display: block;
+  margin: 16px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #525c6e;
+}
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+.table th {
+  color: #788193;
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 13px 20px;
+  border-bottom: 1px solid #e8ebf0;
+  background: #fafbfc;
+}
+.table td {
+  padding: 16px 20px;
+  border-bottom: 1px solid #edf0f4;
+  font-size: 13px;
+}
+.table tbody tr:last-child td {
+  border-bottom: 0;
+}
+.table tbody tr:hover {
+  background: #fafbfc;
+}
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+@keyframes enter {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.enter {
+  animation: enter 0.18s ease;
+}
