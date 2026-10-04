@@ -1,0 +1,15 @@
+packages:
+  - apps/*
+allowBuilds:
+  '@prisma/engines': true
+  prisma: true
+  sharp: true
+  '@nestjs/core': true
+  esbuild: true
+  '@parcel/watcher': false
+  '@scarf/scarf': false
+  cpu-features: false
+  msgpackr-extract: false
+  protobufjs: false
+  ssh2: false
+  unrs-resolver: false

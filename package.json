@@ -1,0 +1,28 @@
+{
+  "name": "relay-webhook-platform",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter @relay/server --filter @relay/web dev",
+    "build": "pnpm --filter @relay/server build && pnpm --filter @relay/web build",
+    "typecheck": "pnpm --recursive typecheck",
+    "test": "pnpm --filter @relay/server test",
+    "test:integration": "pnpm --filter @relay/server test:integration",
+    "test:e2e": "playwright test",
+    "db:generate": "pnpm --filter @relay/server db:generate",
+    "db:migrate": "pnpm --filter @relay/server db:migrate",
+    "db:seed": "pnpm --filter @relay/server db:seed",
+    "setup": "node scripts/setup.mjs",
+    "infra": "docker compose up -d postgres redis receiver",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@playwright/test": "latest",
+    "prettier": "latest"
+  }
+}
