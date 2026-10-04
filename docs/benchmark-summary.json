@@ -1,0 +1,10 @@
+{
+  "date": "2026-10-04",
+  "environment": "macOS ARM64; host development API, Docker PostgreSQL/Redis/receiver; OpenTelemetry export disabled",
+  "workload": "Synthetic ingestion, target 10 events/second for 10 seconds",
+  "requests": 101,
+  "failures": 0,
+  "p95IngestionMs": 25.756958,
+  "averageIngestionMs": 14.494843693069301,
+  "capacityClaim": false
+}
