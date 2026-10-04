@@ -1,0 +1,152 @@
+generator client {
+  provider = "prisma-client"
+  output = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+datasource db {
+  provider = "postgresql"
+}
+model User {
+  id String @id @default(uuid())
+  email String @unique
+  name String
+  passwordHash String
+  createdAt DateTime @default(now())
+  memberships Membership[]
+  sessions Session[]
+}
+model Organization {
+  id String @id @default(uuid())
+  name String
+  createdAt DateTime @default(now())
+  memberships Membership[]
+  endpoints Endpoint[]
+  keys ApiKey[]
+  events Event[]
+  invitations Invitation[]
+  audits AuditLog[]
+}
+model Membership {
+  userId String
+  organizationId String
+  role String @default("member")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  @@id([userId, organizationId])
+}
+model Session {
+  id String @id @default(uuid())
+  tokenHash String @unique
+  userId String
+  expiresAt DateTime
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([expiresAt])
+}
+model ApiKey {
+  id String @id @default(uuid())
+  organizationId String
+  name String
+  prefix String
+  tokenHash String @unique
+  createdAt DateTime @default(now())
+  revokedAt DateTime?
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  @@index([organizationId])
+}
+model Endpoint {
+  id String @id @default(uuid())
+  organizationId String
+  name String
+  url String
+  secretEncrypted String
+  previousSecretEncrypted String?
+  previousSecretUntil DateTime?
+  enabled Boolean @default(true)
+  eventTypes String[] @default([])
+  createdAt DateTime @default(now())
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  deliveries Delivery[]
+  @@index([organizationId, createdAt])
+}
+model Event {
+  id String @id @default(uuid())
+  organizationId String
+  type String
+  payload Json
+  idempotencyKey String
+  requestHash String
+  traceContext Json @default("{}")
+  createdAt DateTime @default(now())
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  deliveries Delivery[]
+  @@unique([organizationId, idempotencyKey])
+  @@index([organizationId, createdAt])
+}
+model Delivery {
+  id String @id @default(uuid())
+  eventId String
+  endpointId String
+  status String @default("pending")
+  generation Int @default(0)
+  attemptCount Int @default(0)
+  failureCount Int @default(0)
+  scheduleCount Int @default(0)
+  nextAttemptAt DateTime @default(now())
+  leaseUntil DateTime?
+  leaseToken String?
+  lastError String?
+  deliveredAt DateTime?
+  createdAt DateTime @default(now())
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  endpoint Endpoint @relation(fields: [endpointId], references: [id])
+  attempts Attempt[]
+  outbox Outbox[]
+  @@unique([eventId, endpointId])
+  @@index([status, nextAttemptAt])
+}
+model Attempt {
+  id String @id @default(uuid())
+  deliveryId String
+  number Int
+  generation Int
+  statusCode Int?
+  durationMs Int
+  responseSnippet String?
+  error String?
+  outcome String
+  createdAt DateTime @default(now())
+  delivery Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  @@index([deliveryId, createdAt])
+}
+model Outbox {
+  id String @id @default(uuid())
+  deliveryId String
+  generation Int
+  sequence Int @default(0)
+  availableAt DateTime @default(now())
+  dispatchedAt DateTime?
+  createdAt DateTime @default(now())
+  delivery Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  @@unique([deliveryId, generation, sequence])
+  @@index([dispatchedAt, availableAt])
+}
+model Invitation {
+  id String @id @default(uuid())
+  organizationId String
+  email String
+  tokenHash String @unique
+  expiresAt DateTime
+  acceptedAt DateTime?
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  @@index([organizationId])
+}
+model AuditLog {
+  id String @id @default(uuid())
+  organizationId String
+  actor String
+  action String
+  resourceId String?
+  createdAt DateTime @default(now())
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  @@index([organizationId, createdAt])
+}
