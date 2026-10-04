@@ -1,0 +1,9 @@
+{
+  "name": "@relay/receiver",
+  "private": true,
+  "scripts": {
+    "dev": "node --watch index.mjs",
+    "start": "node index.mjs",
+    "typecheck": "node --check index.mjs"
+  }
+}

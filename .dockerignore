@@ -1,0 +1,11 @@
+node_modules
+.pnpm-store
+.git
+.env
+apps/*/node_modules
+apps/*/dist
+apps/web/.next
+apps/server/src/generated
+work
+test-results
+playwright-report

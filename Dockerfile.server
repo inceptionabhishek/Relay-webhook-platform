@@ -1,0 +1,14 @@
+FROM node:24-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN npm install -g pnpm@11.19.0
+WORKDIR /app
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY apps/server/package.json apps/server/package.json
+COPY apps/web/package.json apps/web/package.json
+COPY apps/receiver/package.json apps/receiver/package.json
+RUN pnpm install --frozen-lockfile --filter @relay/server...
+COPY apps/server apps/server
+RUN pnpm --filter @relay/server build
+WORKDIR /app/apps/server
+USER node
+CMD ["node", "dist/main.js"]

@@ -1,0 +1,112 @@
+name: relay-webhook
+x-server: &server
+  image: relay-webhook-server:0.1.0
+  build:
+    context: .
+    dockerfile: Dockerfile.server
+  env_file: .env
+  environment: &server-env
+    DATABASE_URL: postgresql://relay:${POSTGRES_PASSWORD:-relay_local}@postgres:5432/relay
+    REDIS_URL: redis://redis:6379
+    WEB_ORIGIN: http://localhost:3000
+    DEMO_RECEIVER_URL: http://receiver:4200
+    ALLOWED_DEVELOPMENT_HOSTS: receiver
+    NODE_ENV: development
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    OTEL_ENABLED: 'true'
+  restart: unless-stopped
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relay_local}
+      POSTGRES_DB: relay
+    ports: ['127.0.0.1:55432:5432']
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U relay -d relay']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory-policy noeviction
+    ports: ['127.0.0.1:56379:6379']
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  receiver:
+    image: node:24-alpine
+    working_dir: /receiver
+    volumes: ['./apps/receiver:/receiver:ro']
+    command: node index.mjs
+    ports: ['127.0.0.1:4200:4200']
+  migrate:
+    <<: *server
+    restart: 'no'
+    command: sh -c 'pnpm db:migrate && pnpm db:seed'
+    depends_on:
+      postgres: { condition: service_healthy }
+  api:
+    <<: *server
+    environment:
+      <<: *server-env
+      OTEL_SERVICE_NAME: relay-api
+    ports: ['127.0.0.1:4000:4000']
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+  dispatcher:
+    <<: *server
+    command: node dist/dispatcher.js
+    environment:
+      <<: *server-env
+      OTEL_SERVICE_NAME: relay-dispatcher
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+  worker:
+    <<: *server
+    command: node dist/worker.js
+    environment:
+      <<: *server-env
+      OTEL_SERVICE_NAME: relay-worker
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+    ports: ['127.0.0.1:3000:3000']
+    depends_on: [api]
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    volumes: ['./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro']
+    ports: ['127.0.0.1:9090:9090']
+  grafana:
+    image: grafana/grafana:12.0.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-relay-local-dashboard}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ['127.0.0.1:3001:3000']
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    command: ['--config=/etc/otel.yml']
+    volumes: ['./infra/otel.yml:/etc/otel.yml:ro']
+    ports: ['127.0.0.1:4318:4318']
+  jaeger:
+    image: jaegertracing/all-in-one:1.67.0
+    ports: ['127.0.0.1:16686:16686']
+volumes:
+  postgres-data:
+  redis-data:
