@@ -1,0 +1,1 @@
+ALTER TABLE "Event" ADD COLUMN "traceContext" JSONB NOT NULL DEFAULT '{}';
