@@ -7,7 +7,8 @@ import { decrypt, signature } from './crypto';
 import { sendWebhook, UnsafeDestination } from './destination';
 import { backoff, classify, retryAfterMs } from './policy';
 import { deliveryAttempts, latency, logger } from './observability';
-export type DeliveryJob = { deliveryId: string; generation: number };
+import { acquireCircuit, finishCircuit, type CircuitPermit } from './circuit';
+export type DeliveryJob = { deliveryId: string; generation: number; outboxId?: string };
 export async function processDelivery(job: DeliveryJob) {
   const event = await db.delivery.findUnique({
     where: { id: job.deliveryId },
@@ -19,6 +20,11 @@ export async function processDelivery(job: DeliveryJob) {
       span.setAttributes({ 'delivery.id': job.deliveryId, 'delivery.generation': job.generation });
       try {
         await runDelivery(job);
+        if (job.outboxId)
+          await db.outbox.updateMany({
+            where: { id: job.outboxId, deliveryId: job.deliveryId, generation: job.generation },
+            data: { completedAt: new Date() },
+          });
       } catch (error) {
         span.recordException(error as Error);
         span.setStatus({ code: SpanStatusCode.ERROR });
@@ -35,7 +41,7 @@ async function runDelivery(job: DeliveryJob) {
     where: {
       id: job.deliveryId,
       generation: job.generation,
-      status: { in: ['pending', 'retrying', 'throttled', 'processing'] },
+      status: { in: ['pending', 'retrying', 'throttled', 'processing', 'paused'] },
       nextAttemptAt: { lte: new Date() },
       OR: [{ leaseUntil: null }, { leaseUntil: { lt: new Date() } }],
     },
@@ -52,6 +58,8 @@ async function runDelivery(job: DeliveryJob) {
   });
   const organizationId = delivery.event.organizationId;
   let slot = false;
+  let permit: CircuitPermit | undefined;
+  let circuitFinished = false;
   const finalize = async (
     data: {
       status: string;
@@ -86,6 +94,15 @@ async function runDelivery(job: DeliveryJob) {
         },
       });
       if (!changed.count) return; // A newer generation or expired lease owns the record now.
+      await tx.outbox.updateMany({
+        where: {
+          deliveryId: delivery.id,
+          generation: job.generation,
+          dispatchedAt: { not: null },
+          completedAt: null,
+        },
+        data: { completedAt: new Date() },
+      });
       if (attempt)
         await tx.attempt.create({
           data: {
@@ -115,6 +132,16 @@ async function runDelivery(job: DeliveryJob) {
     }
     if (Date.now() - delivery.createdAt.getTime() >= config.MAX_DELIVERY_AGE_MS) {
       await finalize({ status: 'failed', lastError: 'Delivery exceeded maximum retry age' });
+      return;
+    }
+    const ageRemaining = config.MAX_DELIVERY_AGE_MS - (Date.now() - delivery.createdAt.getTime());
+    permit = await acquireCircuit(delivery.endpointId);
+    if (!permit.allowed) {
+      await finalize({
+        status: 'paused',
+        lastError: 'Endpoint circuit is open; waiting for recovery probe',
+        delay: Math.min(permit.delay, Math.max(1, ageRemaining)),
+      });
       return;
     }
     const cooldown = await redis.pttl(`cooldown:${delivery.endpointId}`);
@@ -194,6 +221,12 @@ async function runDelivery(job: DeliveryJob) {
       },
       'Delivery attempted',
     );
+    await finishCircuit(
+      delivery.endpointId,
+      permit,
+      statusCode === undefined && outcome === 'failed' ? 'cancelled' : outcome,
+    );
+    circuitFinished = true;
     const attempt = { statusCode, responseSnippet, durationMs, error, outcome };
     const attemptCount = delivery.attemptCount + 1;
     if (outcome === 'delivered') {
@@ -228,6 +261,10 @@ async function runDelivery(job: DeliveryJob) {
       attempt,
     );
   } finally {
+    if (permit?.allowed && !circuitFinished)
+      await finishCircuit(delivery.endpointId, permit, 'cancelled').catch((err) =>
+        logger.error({ err, deliveryId: delivery.id }, 'Circuit permit release failed'),
+      );
     if (slot) await redis.zrem(`active:{${organizationId}}`, leaseToken).catch(() => {});
   }
 }

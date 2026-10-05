@@ -64,6 +64,9 @@ beforeAll(async () => {
     MAX_ATTEMPTS: '3',
     MAX_DELIVERY_AGE_MS: '10000',
     TENANT_DELIVERY_RPS: '100',
+    CIRCUIT_FAILURE_THRESHOLD: '3',
+    CIRCUIT_COOLDOWN_MS: '100',
+    CIRCUIT_MAX_COOLDOWN_MS: '1000',
   });
   execFileSync(
     process.execPath,
@@ -405,4 +408,86 @@ test('invitation acceptance grants member access without owner privileges', asyn
         .send({ name: 'unauthorized' })
     ).status,
   ).toBe(403);
+});
+
+async function endpointEvents(mode: string, count: number) {
+  const endpoint = await auth('post', '/endpoints').send({
+    name: mode,
+    url: `${receiverUrl}/${mode}`,
+  });
+  expect(endpoint.status).toBe(201);
+  const deliveries = [];
+  for (let i = 0; i < count; i++) {
+    const result = await auth('post', '/events')
+      .set('Idempotency-Key', randomUUID())
+      .send({ type: 'operations.test', payload: { i } });
+    expect(result.status).toBe(201);
+    deliveries.push(result.body.deliveries[0]);
+  }
+  return { endpoint: endpoint.body, deliveries };
+}
+test('circuit breaker pauses without HTTP attempts and recovers with one fenced probe', async () => {
+  const { acquireCircuit, finishCircuit, circuitStates } = await import('../src/circuit');
+  const { endpoint, deliveries } = await endpointEvents('fail', 4);
+  for (const delivery of deliveries.slice(0, 3))
+    await processDelivery({ deliveryId: delivery.id, generation: 0 });
+  expect((await circuitStates([endpoint.id]))[endpoint.id].state).toBe('open');
+  const paused = deliveries[3];
+  await processDelivery({ deliveryId: paused.id, generation: 0 });
+  const record = await db.delivery.findUniqueOrThrow({ where: { id: paused.id } });
+  expect(record.status).toBe('paused');
+  expect(record.attemptCount).toBe(0);
+  expect(await db.attempt.count({ where: { deliveryId: paused.id } })).toBe(0);
+  await redis.hset(`circuit:{${endpoint.id}}`, 'nextProbeAt', '0');
+  const permits = await Promise.all(Array.from({ length: 10 }, () => acquireCircuit(endpoint.id)));
+  expect(permits.filter((p) => p.allowed)).toHaveLength(1);
+  const probe = permits.find((p) => p.allowed)!;
+  await redis.hset(`circuit:{${endpoint.id}}`, 'probeUntil', '0');
+  // A late success after probe expiry must not close the newly opened circuit.
+  await finishCircuit(endpoint.id, probe, 'delivered');
+  expect((await circuitStates([endpoint.id]))[endpoint.id].state).toBe('open');
+  await auth('patch', `/endpoints/${endpoint.id}`).send({ url: `${receiverUrl}/success` });
+  const requestProbe = await auth('post', `/endpoints/${endpoint.id}/probe`).send({});
+  expect(requestProbe.status).toBe(201);
+  await processDelivery({ deliveryId: paused.id, generation: 0 });
+  expect((await db.delivery.findUniqueOrThrow({ where: { id: paused.id } })).status).toBe(
+    'delivered',
+  );
+  expect((await circuitStates([endpoint.id]))[endpoint.id].state).toBe('closed');
+  const history = await auth('get', `/endpoints/${endpoint.id}/circuit-history`);
+  expect(history.body.some((h: any) => h.toState === 'half-open')).toBe(true);
+  expect(history.body.some((h: any) => h.toState === 'closed')).toBe(true);
+  await freshWorkspace();
+  expect((await auth('post', `/endpoints/${endpoint.id}/probe`).send({})).status).toBe(404);
+  expect((await auth('get', `/endpoints/${endpoint.id}/circuit-history`)).status).toBe(404);
+});
+test('old circuit responses cannot overwrite new state; 429 does not trip the closed circuit', async () => {
+  const { acquireCircuit, finishCircuit, circuitStates } = await import('../src/circuit');
+  const { endpoint } = await endpointEvents('success', 0);
+  const stale = await acquireCircuit(endpoint.id);
+  for (let i = 0; i < 3; i++)
+    await finishCircuit(endpoint.id, await acquireCircuit(endpoint.id), 'retry');
+  await finishCircuit(endpoint.id, stale, 'delivered');
+  expect((await circuitStates([endpoint.id]))[endpoint.id].state).toBe('open');
+  await redis.hset(`circuit:{${endpoint.id}}`, 'nextProbeAt', '0');
+  await finishCircuit(endpoint.id, await acquireCircuit(endpoint.id), 'delivered');
+  for (let i = 0; i < 5; i++)
+    await finishCircuit(endpoint.id, await acquireCircuit(endpoint.id), 'throttled');
+  expect((await circuitStates([endpoint.id]))[endpoint.id].state).toBe('closed');
+});
+test('paused circuit deliveries still expire at the maximum delivery age', async () => {
+  const { endpoint, deliveries } = await endpointEvents('success', 1);
+  await redis.hset(
+    `circuit:{${endpoint.id}}`,
+    'state',
+    'open',
+    'nextProbeAt',
+    String(Date.now() + 60000),
+  );
+  await db.delivery.update({ where: { id: deliveries[0].id }, data: { createdAt: new Date(0) } });
+  await processDelivery({ deliveryId: deliveries[0].id, generation: 0 });
+  const expired = await db.delivery.findUniqueOrThrow({ where: { id: deliveries[0].id } });
+  expect(expired.status).toBe('failed');
+  expect(expired.attemptCount).toBe(0);
+  expect(expired.lastError).toContain('maximum retry age');
 });

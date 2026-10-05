@@ -31,6 +31,7 @@ import { AuthGuard, AuthRequest, browserOnly, ownerOnly, sessionUser } from './a
 import { config } from './config';
 import { resolveDestination } from './destination';
 import { rateLimit } from './queue';
+import { circuitStates, requestProbe } from './circuit';
 const email = z
   .string()
   .email()
@@ -217,12 +218,12 @@ export class PlatformController {
   @Get('endpoints')
   async endpoints(@Req() req: AuthRequest) {
     browserOnly(req);
-    return (
-      await db.endpoint.findMany({
-        where: { organizationId: req.principal.organizationId },
-        orderBy: { createdAt: 'desc' },
-      })
-    ).map(publicEndpoint);
+    const endpoints = await db.endpoint.findMany({
+      where: { organizationId: req.principal.organizationId },
+      orderBy: { createdAt: 'desc' },
+    });
+    const circuits = await circuitStates(endpoints.map((e) => e.id));
+    return endpoints.map((e) => ({ ...publicEndpoint(e), circuit: circuits[e.id] }));
   }
   @Post('endpoints')
   @ApiBody({
@@ -280,6 +281,56 @@ export class PlatformController {
     if (!result.count) throw new NotFoundException('Endpoint not found');
     await audit(req, 'endpoint.updated', endpointId);
     return { ok: true };
+  }
+  @Get('endpoints/:id/circuit-history')
+  async circuitHistory(@Param('id') endpointId: string, @Req() req: AuthRequest) {
+    browserOnly(req);
+    const endpoint = await db.endpoint.findFirst({
+      where: { id: id(endpointId), organizationId: req.principal.organizationId },
+    });
+    if (!endpoint) throw new NotFoundException('Endpoint not found');
+    return db.circuitTransition.findMany({
+      where: { endpointId },
+      orderBy: { createdAt: 'desc' },
+      take: 25,
+    });
+  }
+  @Post('endpoints/:id/probe')
+  @ApiOperation({ summary: 'Make the next pending delivery eligible for a recovery probe' })
+  async probe(@Param('id') endpointId: string, @Req() req: AuthRequest) {
+    ownerOnly(req);
+    const endpoint = await db.endpoint.findFirst({
+      where: { id: id(endpointId), organizationId: req.principal.organizationId },
+    });
+    if (!endpoint) throw new NotFoundException('Endpoint not found');
+    if (!endpoint.enabled) throw new BadRequestException('Enable the endpoint before probing');
+    const circuit = await requestProbe(endpointId);
+    if (circuit.state !== 'open')
+      throw new ConflictException('Only an open circuit can request an immediate probe');
+    await db.$transaction(async (tx) => {
+      const [delivery] = await tx.$queryRaw<{ id: string; generation: number }[]>`
+        SELECT id, generation FROM "Delivery" WHERE "endpointId" = ${endpointId} AND status = 'paused'
+        AND ("leaseUntil" IS NULL OR "leaseUntil" < now())
+        ORDER BY "nextAttemptAt", id LIMIT 1 FOR UPDATE SKIP LOCKED`;
+      if (!delivery) return;
+      const updated = await tx.delivery.update({
+        where: { id: delivery.id },
+        data: {
+          nextAttemptAt: new Date(),
+          scheduleCount: { increment: 1 },
+        },
+      });
+      await tx.outbox.create({
+        data: {
+          deliveryId: delivery.id,
+          generation: delivery.generation,
+          sequence: updated.scheduleCount,
+          availableAt: updated.nextAttemptAt,
+        },
+      });
+    });
+    await audit(req, 'endpoint.probe_requested', endpointId);
+    return { ok: true, message: 'The next eligible delivery will probe the endpoint.' };
   }
   @Post('endpoints/:id/rotate-secret')
   async rotateSecret(@Param('id') endpointId: string, @Req() req: AuthRequest) {
@@ -472,7 +523,7 @@ export class PlatformController {
     browserOnly(req);
     const limit = z.coerce.number().int().min(1).max(100).default(25).parse(query.limit);
     const status = z
-      .enum(['pending', 'processing', 'retrying', 'throttled', 'delivered', 'failed'])
+      .enum(['pending', 'processing', 'retrying', 'throttled', 'paused', 'delivered', 'failed'])
       .optional()
       .parse(query.status || undefined);
     const cursor = query.cursor ? id(query.cursor) : undefined;
