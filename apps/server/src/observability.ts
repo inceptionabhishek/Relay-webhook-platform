@@ -49,3 +49,10 @@ export const scheduleDelay = new Histogram({
   buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 300],
   registers: [registry],
 });
+
+export const alertChanges = new Counter({
+  name: 'relay_alert_changes_total',
+  help: 'Delivery alert incident transitions',
+  labelNames: ['state'],
+  registers: [registry],
+});
