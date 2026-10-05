@@ -10,6 +10,7 @@ import { ZodError } from 'zod';
 import { Controller, Get, Res } from '@nestjs/common';
 import type { Response } from 'express';
 import { AuthController, PlatformController } from './api';
+import { RetentionController, AlertsController, TestingController } from './operations-api';
 import { AuthGuard } from './auth';
 import { db } from './db';
 import { redis } from './queue';
@@ -62,7 +63,14 @@ class HealthController {
   }
 }
 @Module({
-  controllers: [AuthController, PlatformController, HealthController],
+  controllers: [
+    AuthController,
+    PlatformController,
+    HealthController,
+    RetentionController,
+    AlertsController,
+    TestingController,
+  ],
   providers: [AuthGuard],
 })
 class AppModule {}
@@ -89,7 +97,7 @@ export async function createApp() {
     new DocumentBuilder()
       .setTitle('Relay webhook platform')
       .setDescription(
-        'Tenant-scoped webhook delivery. API keys publish events; browser sessions manage workspaces.',
+        'Tenant-scoped webhook delivery. API keys use explicit publishing, reading, replay, and testing scopes; browser owners manage workspaces.',
       )
       .setVersion('0.1.0')
       .addBearerAuth()

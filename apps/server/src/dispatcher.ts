@@ -2,6 +2,8 @@ import './telemetry';
 import { createServer } from 'node:http';
 import { dispatchBatch, reconcile } from './outbox';
 import { processReplayBatches } from './replay';
+import { sweepRetention } from './retention';
+import { sweepAlerts } from './alerts';
 import { logger, registry } from './observability';
 import { db } from './db';
 import { redis, deliveryQueue } from './queue';
@@ -17,13 +19,22 @@ process.once('SIGINT', () => {
   running = false;
 });
 void (async () => {
-  let ticks = 0;
+  let lastMaintenance = 0;
+  let lastReconcile = 0;
   logger.info('Outbox dispatcher ready');
   while (running) {
     try {
+      if (Date.now() - lastMaintenance >= 10000) {
+        lastMaintenance = Date.now();
+        await sweepAlerts();
+        await sweepRetention();
+      }
       await processReplayBatches();
       await dispatchBatch();
-      if (ticks++ % 20 === 0) await reconcile();
+      if (Date.now() - lastReconcile >= 10000) {
+        lastReconcile = Date.now();
+        await reconcile();
+      }
     } catch (err) {
       logger.error({ err }, 'Dispatch interrupted; outbox retained');
     }
