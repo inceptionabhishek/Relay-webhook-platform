@@ -2,7 +2,7 @@
 
 Relay is a webhook delivery platform. Your backend publishes an event once; Relay sends it to subscribed HTTP endpoints, retries temporary failures, and keeps a history of every delivery attempt.
 
-The dashboard lets you manage endpoints and credentials, inspect payloads and responses, and replay deliveries after fixing a problem. Endpoint circuit breakers pause unhealthy receivers, a failure inbox supports tracked bulk replay, and tenant-aware scheduling bounds each workspace's queued work. The API, dispatcher, and delivery workers run as separate processes, with PostgreSQL as the durable store and Redis/BullMQ for background work.
+The dashboard lets you manage endpoints and credentials, inspect payloads and responses, and replay deliveries after fixing a problem. Endpoint circuit breakers pause unhealthy receivers, a failure inbox supports tracked bulk replay, and tenant-aware scheduling bounds each workspace's queued work. Workspace tools include delivery alerts, signed test webhooks, scoped API keys, and configurable retention. The API, dispatcher, and delivery workers run as separate processes, with PostgreSQL as the durable store and Redis/BullMQ for background work.
 
 ## Run locally
 
@@ -72,7 +72,7 @@ The developer registers with their name, email, password, and workspace name, su
 
 A new workspace starts empty. Its endpoints, events, deliveries, credentials, and audit records are isolated from other workspaces. Users can create additional workspaces and switch between those they belong to.
 
-The dashboard has views for the overview, events, failure inbox, endpoints, API keys, team, audit log, and documentation.
+The dashboard has views for the overview, events, failure inbox, endpoints, alerts, testing, retention settings, API keys, team, audit log, and documentation.
 
 ### 2. Add receiving endpoints
 
@@ -102,11 +102,15 @@ Delivery is **at least once**. A receiver may process a request even if its resp
 
 The owner creates a named key under **API keys** and copies its value, which is shown once. The key belongs in the producer backend's secret configuration, never in frontend code.
 
-API keys can publish events. They cannot administer the workspace or read dashboard data. Rotation revokes the old key immediately, so the producer must be updated with the replacement.
+Choose the minimum permissions the integration needs. Publishing keys use `events:publish`; separate keys can read events or endpoints, replay deliveries, or run webhook tests. Optionally restrict which event types a key may publish and give it an expiry. Existing keys remain publish-only. Keys cannot administer workspace settings, alert rules, or credentials. Rotation revokes the old key immediately and preserves its permissions, event-type restrictions, and expiry, so update the producer with the replacement.
 
 ### 5. Send a test event
 
-Before connecting real traffic, the developer uses **Publish event** in the dashboard with an event type, an idempotency key, and a JSON payload:
+Before connecting real traffic, open **Testing**, choose one enabled endpoint, and select a sample order, subscription, or report payload. A test targets only that endpoint, even when its subscriptions differ. Tests send real HTTP requests with `webhook-test: true`; the receiving service should recognize that header and avoid business side effects. Normal signing, retries, circuit breakers, and quotas still apply.
+
+The testing view shows status, response previews, duration, outgoing headers, and the exact request body. Its signature verifier checks the captured body, timestamp, and signatures against the endpoint's current secret and valid previous secret. Test traffic is excluded from the production overview and delivery-alert evaluation.
+
+Use **Publish event** when checking ordinary subscription routing. Provide an event type, an idempotency key, and a JSON payload:
 
 ```json
 {
@@ -137,7 +141,7 @@ curl http://localhost:4000/events \
 
 Relay only knows about events the producer publishes. It does not automatically detect orders or connect to an ecommerce provider.
 
-If the producer loses the API response, it can retry the same request with the same idempotency key. Within that workspace, Relay returns the original event instead of creating another one. Reusing the key with different contents returns `409`. The current fingerprint uses the parsed JSON's serialized field order, so preserve the request structure when retrying.
+If the producer loses the API response, it can retry the same request with the same idempotency key. Within that workspace, Relay returns the original event instead of creating another one. Reusing the key with different contents returns `409`. An event removed by retention returns `410` on a matching retry; a small receipt prevents republishing it. The current fingerprint uses the parsed JSON's serialized field order, so preserve the request structure when retrying.
 
 ### 7. Relay accepts and dispatches the event
 
@@ -182,6 +186,10 @@ After setup, the producer publishes events and Relay delivers them without dashb
 Owners manage endpoints, API keys, and invitations. Members can inspect events, publish events, and replay deliveries. Invitations generate shareable links, bind to the invited email, and expire after seven days; invitation emails are not sent.
 
 Signing-secret rotation includes a 24-hour overlap with the previous secret. Owners can also disable endpoints and revoke API keys. Configuration changes and event actions appear in the audit log.
+
+Under **Alerts**, an owner can watch one endpoint or all endpoints, choose a failure threshold, time window, and incident cooldown, and optionally select a notification endpoint. Rules count distinct production deliveries with failed attempts since the endpoint's latest success. Relay opens one incident per rule and endpoint, supports acknowledgement, and resolves it after recovery or when the failure window clears. Opening and recovery notifications are signed webhooks delivered through the existing outbox. Test events, notification events, and `429` deferrals do not trigger alerts.
+
+Under **Settings**, owners can configure event and attempt retention independently. Empty fields keep data indefinitely; cleanup is disabled by default. Preview counts show eligible history, and cleanup runs automatically in bounded batches or on request. Pending work, live delivery leases, and queued replays are protected. Deleting an event removes its deliveries and attempts, while a minimal idempotency receipt and replay-batch history remain. Deletion is permanent, and historical statistics reflect the remaining records.
 
 The normal flow is:
 
@@ -232,7 +240,7 @@ Failed deliveries remain in PostgreSQL as the application's failure inbox. BullM
 
 Redis is also used for authentication/rate-limit checks. If it is unavailable, ingestion fails closed; previously accepted events remain durable and can resume delivery when dependencies recover.
 
-See [architecture](docs/architecture.md) for the concurrency model, failure windows, and guarantees. [Delivery operations](docs/delivery-operations.md) covers circuit breakers, bulk replay, scheduler admission, configuration, and upgrade steps.
+See [architecture](docs/architecture.md) for the concurrency model, failure windows, and guarantees. [Delivery operations](docs/delivery-operations.md) covers circuit breakers, bulk replay, and scheduler admission. [Workspace operations](docs/workspace-operations.md) documents retention, alerts, testing, scoped keys, and their API contracts.
 
 ## Try the failure scenarios
 
@@ -294,4 +302,4 @@ The [deployment guide](docs/deployment.md) describes an AWS deployment path. The
 
 This is an initial version. Delivery ordering is not guaranteed, and receiver-side deduplication is required. Tenant-aware round-robin dispatch and bounded queue admission reduce interference. They do not provide weighted service or a per-tenant latency SLA.
 
-Dashboard SSE reads PostgreSQL every two seconds and is intended for a modest number of users. Retention policies, password reset, billing, invitation email, automatic third-party integrations, and automated cloud provisioning are not implemented. Production SLOs and capacity limits have not been established. Local setup does not create AWS resources.
+Dashboard SSE reads PostgreSQL every two seconds and is intended for a modest number of users. Alerts are available in the app and through signed webhook destinations; email and native chat-service notifications are not implemented. Retention removes payload and attempt history, while minimal idempotency receipts, audit records, alert history, and replay-batch metadata are retained. Password reset, billing, invitation email, automatic third-party integrations, and automated cloud provisioning are not implemented. Production SLOs and capacity limits have not been established. Local setup does not create AWS resources.

@@ -24,7 +24,7 @@ State is in Redis; transitions are recorded in PostgreSQL. These writes cannot c
 
 The failure inbox lists deliveries with terminal `failed` status, with filters for event type and endpoint, a failed-delivery count, and cursor pagination. Inspect opens the existing payload and attempt history. Select individual deliveries or an enabled-endpoint page, then start a replay batch.
 
-`POST /replay-batches` requires a browser session, the workspace header, an `Idempotency-Key`, and `{ "deliveryIds": ["..."] }`. It accepts 1–500 IDs and returns `202`. All IDs must belong to that workspace and be failed at acceptance. The sorted, deduplicated ID set is fingerprinted; identical retries return the same batch, and changed selections with the same key return `409`.
+`POST /replay-batches` requires a browser session and workspace header, or an API key with `deliveries:replay`, plus an `Idempotency-Key` and `{ "deliveryIds": ["..."] }`. It accepts 1–500 IDs and returns `202`. All IDs must belong to that workspace and be failed at acceptance. The sorted, deduplicated ID set is fingerprinted; identical retries return the same batch, and changed selections with the same key return `409`.
 
 A batch stores the delivery generation at acceptance. The dispatcher processes up to 25 items per tick inside a PostgreSQL transaction using row locks. Each item either:
 
@@ -46,7 +46,7 @@ Endpoints:
 | `GET /endpoints/:id/circuit-history` | Recent endpoint transitions                                          |
 | `POST /endpoints/:id/probe`          | Owner-only immediate probe request                                   |
 
-API keys remain publish-only. Members can use the failure inbox and replay; owners control recovery probes. All queries enforce workspace isolation.
+Keys with `events:read` can inspect the failure inbox; `deliveries:replay` permits single/bulk replay and batch inspection. Members can use the failure inbox and replay; owners control recovery probes. All queries enforce workspace isolation. Retention protects queued replay items and preserves batch metadata after delivery history expires.
 
 ## Tenant-aware scheduling
 

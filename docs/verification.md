@@ -34,3 +34,21 @@ No production capacity or availability claim is made. CI is configured; remote C
 Integration coverage includes atomic single-probe admission, stale circuit results, probe lease expiry, maximum delivery age while paused, 429 handling, concurrent idempotent replay requests, changed/disabled delivery skips, bounded replay chunks, API-key scope restrictions, new-tenant admission behind a large backlog, concurrent dispatcher budgets, and abandoned scheduling-slot recovery.
 
 Browser tests ran against host application processes with Docker PostgreSQL, Redis, and the receiver. Application and infrastructure processes started for these checks were stopped afterward. New container images and a full monitoring-stack smoke run were not repeated for this update. The earlier ingestion benchmark was not rerun and does not measure the new scheduler's capacity.
+
+## Workspace operations update — 2026-10-05
+
+| Check                              | Result                                                                                                                                                                                                        |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript and formatting          | Passed                                                                                                                                                                                                        |
+| Unit security/policy tests         | 24 passed                                                                                                                                                                                                     |
+| PostgreSQL/Redis integration tests | 32 passed                                                                                                                                                                                                     |
+| Production builds                  | Server and Next.js webpack builds passed                                                                                                                                                                      |
+| Browser workflows                  | 3 passed, including targeted test delivery, exact-body signature verification/tampering, scoped key creation, retention settings/manual cleanup, incident acknowledgement, and opening/recovery notifications |
+| Responsive layout                  | Testing and Alerts checked at 390px with no document-level horizontal overflow; mobile Testing and desktop Alerts screenshots inspected                                                                       |
+| Database upgrade                   | Workspace-operations migration applied to the existing local database; Prisma schema comparison reports no difference                                                                                         |
+
+New integration coverage exercises permission/event-type restrictions, key expiry and workspace binding, concurrent rotation with one successor, member/owner authorization, targeted testing independent of subscriptions, current/previous-secret verification, source exclusion from production statistics, concurrent incident deduplication, signed notifications, cooldown and recovery-window behavior, rule-target changes, and cross-tenant access rejection.
+
+Retention checks cover attempt-only cleanup, queued and active replay protection, live leases, recently completed work, concurrent worker row locks, concurrent cleanup, preserved replay-batch history, `410` responses for expired events, and rejected reuse of an expired idempotency key.
+
+Browser tests ran against temporary host application processes and Docker PostgreSQL, Redis, and the receiver. OpenTelemetry export was disabled for this run. Processes started for verification were stopped afterward. Container images, remote CI, the full monitoring stack, and ingestion benchmarks were not revalidated for these features; earlier measurements do not establish their production capacity.

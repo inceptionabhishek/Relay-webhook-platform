@@ -29,4 +29,4 @@ PostgreSQL needs backups and a tested restore process. Keep the encryption key r
 - Keep graceful worker shutdown enabled so ongoing requests can finish. Forced termination is covered by lease/reconciliation recovery and receiver deduplication.
 - Start with load tests on a documented environment. Choose SLOs only after measuring ingestion and end-to-end delivery independently.
 
-Further production work includes account recovery, data retention, dashboards/alerts for saturation and failed deliveries, secrets rotation procedures, infrastructure-as-code, deployment rollback, and security review.
+Workspace retention and delivery alerts are implemented; configure their policies and a healthy signed notification receiver before relying on them. Further production work includes account recovery, infrastructure saturation alerts, retention for operational metadata/backups, secrets rotation procedures, infrastructure-as-code, deployment rollback, and security review.

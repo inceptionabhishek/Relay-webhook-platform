@@ -18,10 +18,15 @@ Third-party endpoints fail, time out, return rate limits, and sometimes process 
 10. How shared circuit epochs and one half-open probe prevent stale responses from reopening traffic.
 11. Why bulk replay snapshots generations, rechecks delivery state, and separates scheduling completion from HTTP completion.
 12. Which bottleneck you would address next based on measurements rather than adding infrastructure speculatively.
+13. Why retention must coordinate with worker/replay locks and preserve idempotency receipts after deleting payloads.
+14. How incident deduplication, distinct-delivery thresholds, cooldowns, and source tags prevent noisy or recursive alerts.
+15. Why key scopes, workspace binding, expiry, event-type restrictions, and concurrent rotation are separate permission checks.
 
 ## Demo sequence
 
 Show successful delivery, duplicate ingestion, a flaky receiver recovering, an endpoint throttling, a permanent failure, replay history, API-key revocation, and isolation between two workspaces. Show an open endpoint circuit, fix its receiver, and request a recovery probe. Use the failure inbox to replay a batch and inspect its skip reasons and delivery outcomes. Show a trace and a dashboard while explaining the code path.
+
+Send a targeted test webhook, verify its signature, and change the raw body to demonstrate a failed verification. Create a read-only key and show that publishing is denied. Configure an alert, trigger distinct delivery failures, acknowledge the incident, then fix and replay the receiver to demonstrate recovery notification. Explain how opt-in retention deletes history while preventing old idempotency keys from creating duplicates.
 
 ## Resume wording
 
