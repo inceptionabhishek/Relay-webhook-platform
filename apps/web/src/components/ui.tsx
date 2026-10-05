@@ -80,6 +80,9 @@ export function Badge({ status }: { status: string }) {
     failed: 'bg-red-50 text-red-600',
     retrying: 'bg-amber-50 text-amber-700',
     throttled: 'bg-violet-50 text-violet-600',
+    paused: 'bg-orange-50 text-orange-700',
+    skipped: 'bg-amber-50 text-amber-700',
+    replayed: 'bg-blue-50 text-blue-600',
     pending: 'bg-slate-100 text-slate-600',
     processing: 'bg-blue-50 text-blue-600',
   };

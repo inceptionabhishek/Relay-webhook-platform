@@ -36,9 +36,17 @@ import {
   YAxis,
 } from 'recharts';
 import { Button, Modal, Badge } from '@/components/ui';
+import { FailureInbox, EndpointCircuit } from '@/components/delivery-operations';
 import { API, api, time, type Endpoint, type Event, type Stats } from '@/lib/api';
 type View =
-  'Overview' | 'Events' | 'Endpoints' | 'API keys' | 'Team' | 'Audit log' | 'Documentation';
+  | 'Overview'
+  | 'Events'
+  | 'Failure inbox'
+  | 'Endpoints'
+  | 'API keys'
+  | 'Team'
+  | 'Audit log'
+  | 'Documentation';
 type Me = {
   name: string;
   email: string;
@@ -47,6 +55,7 @@ type Me = {
 const nav = [
   { name: 'Overview', icon: LayoutDashboard },
   { name: 'Events', icon: Activity },
+  { name: 'Failure inbox', icon: Bell },
   { name: 'Endpoints', icon: Webhook },
   { name: 'API keys', icon: KeyRound },
   { name: 'Team', icon: Users },
@@ -235,6 +244,7 @@ function Dashboard({ me }: { me: Me }) {
     queryKey: ['endpoints', org],
     queryFn: () => api('/endpoints', org),
     enabled: !!org,
+    refetchInterval: 5000,
   });
   const events = useQuery<{ items: Event[]; nextCursor: string | null }>({
     queryKey: ['events', org, search, status, cursor],
@@ -577,6 +587,7 @@ function Dashboard({ me }: { me: Me }) {
                   {
                     Overview: 'A clear view of your events and integration health.',
                     Events: 'Inspect payloads, trace attempts, and replay deliveries.',
+                    'Failure inbox': 'Find failed deliveries and track recovery in batches.',
                     Endpoints: 'Connect your services and control where events go.',
                     'API keys': 'Manage credentials for publishing events to your workspace.',
                     Team: 'Collaborate with your team across one workspace.',
@@ -749,7 +760,7 @@ function Dashboard({ me }: { me: Me }) {
                     Current state across your workspace
                   </p>
                   <div className="mt-7 space-y-5">
-                    {['delivered', 'retrying', 'throttled', 'failed'].map((s) => (
+                    {['delivered', 'retrying', 'throttled', 'paused', 'failed'].map((s) => (
                       <div key={s}>
                         <div className="mb-2 flex justify-between">
                           <Badge status={s} />
@@ -810,13 +821,19 @@ function Dashboard({ me }: { me: Me }) {
                   }}
                 >
                   <option value="">All statuses</option>
-                  {['delivered', 'failed', 'retrying', 'throttled', 'pending', 'processing'].map(
-                    (s) => (
-                      <option key={s} value={s}>
-                        {s}
-                      </option>
-                    ),
-                  )}
+                  {[
+                    'delivered',
+                    'failed',
+                    'retrying',
+                    'throttled',
+                    'paused',
+                    'pending',
+                    'processing',
+                  ].map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
                 </select>
               </div>
               {eventTable(rows)}
@@ -837,6 +854,14 @@ function Dashboard({ me }: { me: Me }) {
               </div>
             </section>
           )}
+          {view === 'Failure inbox' && (
+            <FailureInbox
+              key={org}
+              org={org}
+              endpoints={endpoints.data ?? []}
+              inspect={setEventId}
+            />
+          )}
           {view === 'Endpoints' && (
             <div className="grid gap-4 lg:grid-cols-2">
               {endpoints.data?.map((endpoint) => (
@@ -855,6 +880,7 @@ function Dashboard({ me }: { me: Me }) {
                       ? endpoint.eventTypes.join(', ')
                       : 'All event types'}
                   </p>
+                  <EndpointCircuit endpoint={endpoint} org={org} owner={owner} />
                   <div className="mt-5 flex flex-wrap gap-2 border-t border-slate-100 pt-4">
                     {owner && (
                       <>

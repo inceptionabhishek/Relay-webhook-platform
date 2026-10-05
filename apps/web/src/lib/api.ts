@@ -34,6 +34,11 @@ export type Endpoint = {
   enabled: boolean;
   eventTypes: string[];
   createdAt: string;
+  circuit?: {
+    state: 'closed' | 'open' | 'half-open' | 'unavailable';
+    failures: number;
+    nextProbeAt: number;
+  };
 };
 export type Delivery = {
   id: string;
