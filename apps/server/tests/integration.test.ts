@@ -581,7 +581,147 @@ test('bulk replay skips disabled endpoints and rejects active deliveries and ove
     ).status,
   ).toBe(400);
 });
+async function quiesceScheduler() {
+  await db.delivery.updateMany({
+    where: { status: { notIn: ['delivered', 'failed'] } },
+    data: { status: 'failed' },
+  });
+  await db.outbox.updateMany({ data: { completedAt: new Date() } });
+  await queue.drain(true);
+}
+test('fair scheduler bounds heavy-tenant queued work and promptly admits a new tenant', async () => {
+  const { config } = await import('../src/config');
+  await quiesceScheduler();
+  const { endpoint } = await endpointEvents('success', 0);
+  for (let i = 0; i < 60; i++)
+    await db.event.create({
+      data: {
+        organizationId: org,
+        type: 'heavy',
+        payload: {},
+        idempotencyKey: randomUUID(),
+        requestHash: 'test',
+        deliveries: { create: { endpointId: endpoint.id, outbox: { create: { generation: 0 } } } },
+      },
+    });
+  const heavyOrg = org;
+  expect(await dispatchBatch()).toBe(config.SCHEDULER_TENANT_IN_FLIGHT);
+  await freshWorkspace();
+  const { deliveries } = await endpointEvents('success', 1);
+  expect(await dispatchBatch()).toBe(1);
+  expect(
+    (await db.outbox.findFirstOrThrow({ where: { deliveryId: deliveries[0].id } })).dispatchedAt,
+  ).not.toBeNull();
+  const heavyJobs = await db.outbox.findMany({
+    where: {
+      dispatchedAt: { not: null },
+      completedAt: null,
+      delivery: { event: { organizationId: heavyOrg } },
+    },
+  });
+  expect(heavyJobs).toHaveLength(config.SCHEDULER_TENANT_IN_FLIGHT);
+  const heavyJob = heavyJobs[0];
+  await processDelivery({
+    deliveryId: heavyJob.deliveryId,
+    generation: heavyJob.generation,
+    outboxId: heavyJob.id,
+  });
+  expect(await dispatchBatch()).toBe(1); // one released tenant slot admits one more job
+  expect(
+    await db.outbox.count({
+      where: {
+        dispatchedAt: { not: null },
+        completedAt: null,
+        delivery: { event: { organizationId: heavyOrg } },
+      },
+    }),
+  ).toBe(config.SCHEDULER_TENANT_IN_FLIGHT);
+});
+test('concurrent dispatchers share a bounded global budget and round-robin tenant turns', async () => {
+  const { config } = await import('../src/config');
+  await quiesceScheduler();
+  const tenantCount =
+    Math.ceil(config.SCHEDULER_MAX_IN_FLIGHT / config.SCHEDULER_TENANT_IN_FLIGHT) + 2;
+  const orgIds = [];
+  for (let i = 0; i < tenantCount; i++) {
+    const tenant = await db.organization.create({ data: { name: `Fairness ${i}` } });
+    orgIds.push(tenant.id);
+    const endpoint = await db.endpoint.create({
+      data: {
+        name: 'receiver',
+        url: `${receiverUrl}/success`,
+        organizationId: tenant.id,
+        secretEncrypted: 'unused',
+      },
+    });
+    for (let j = 0; j < 4; j++)
+      await db.event.create({
+        data: {
+          organizationId: tenant.id,
+          type: 'fair',
+          payload: {},
+          idempotencyKey: randomUUID(),
+          requestHash: 'test',
+          deliveries: {
+            create: {
+              endpointId: endpoint.id,
+              outbox: { create: { generation: 0 } },
+            },
+          },
+        },
+      });
+  }
+  await Promise.all([dispatchBatch(), dispatchBatch(), dispatchBatch()]);
+  const queued = await db.outbox.findMany({
+    where: { dispatchedAt: { not: null }, completedAt: null },
+    include: { delivery: { include: { event: true } } },
+    orderBy: { dispatchedAt: 'asc' },
+  });
+  expect(queued).toHaveLength(config.SCHEDULER_MAX_IN_FLIGHT);
+  const counts = new Map<string, number>();
+  queued.forEach((o) =>
+    counts.set(
+      o.delivery.event.organizationId,
+      (counts.get(o.delivery.event.organizationId) ?? 0) + 1,
+    ),
+  );
+  expect(counts.size).toBe(tenantCount);
+  expect(Math.max(...counts.values())).toBeLessThanOrEqual(config.SCHEDULER_TENANT_IN_FLIGHT);
+  expect(
+    new Set(queued.slice(0, tenantCount).map((o) => o.delivery.event.organizationId)).size,
+  ).toBe(tenantCount);
+  await quiesceScheduler();
+});
 
+test('reconciliation releases lost scheduling slots even with an older future outbox row', async () => {
+  await quiesceScheduler();
+  const { deliveries } = await endpointEvents('success', 1);
+  const delivery = deliveries[0];
+  await db.delivery.update({
+    where: { id: delivery.id },
+    data: { nextAttemptAt: new Date(0), scheduleCount: 1 },
+  });
+  await db.outbox.updateMany({
+    where: { deliveryId: delivery.id },
+    data: { dispatchedAt: new Date(0) },
+  });
+  await db.outbox.create({
+    data: {
+      deliveryId: delivery.id,
+      generation: 0,
+      sequence: 1,
+      availableAt: new Date(Date.now() + 60000),
+    },
+  });
+  await reconcile();
+  const first = await db.outbox.findFirstOrThrow({
+    where: { deliveryId: delivery.id, sequence: 0 },
+  });
+  expect(first.completedAt).not.toBeNull();
+  expect(await db.outbox.count({ where: { deliveryId: delivery.id } })).toBe(3);
+  expect(await dispatchBatch()).toBe(1);
+  await quiesceScheduler();
+});
 test('bulk replay runs in bounded durable chunks and resumes remaining items', async () => {
   const { processReplayBatches } = await import('../src/replay');
   const { endpoint } = await endpointEvents('success', 0);
