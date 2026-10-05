@@ -145,3 +145,134 @@ test('failure inbox bulk replay and endpoint circuit recovery', async ({ page })
   await expect(card.getByText('Circuit: closed', { exact: true })).toBeVisible();
   expect(errors).toEqual([]);
 });
+
+test('test diagnostics, scoped keys, retention settings and delivery alerts', async ({ page }) => {
+  test.setTimeout(90000);
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  await page.goto('/');
+  await page.getByRole('button', { name: 'New to Relay? Create an account' }).click();
+  await page.getByLabel('Your name').fill('Workspace Operator');
+  await page.getByLabel('Workspace name').fill(`Workspace tools ${Date.now()}`);
+  await page.getByLabel('Email address').fill(`tools-${Date.now()}@test.local`);
+  await page.getByLabel('Password', { exact: true }).fill('strong-browser-password');
+  await page.getByRole('button', { name: 'Create workspace', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Delivery overview' })).toBeVisible();
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
+  const receiver = process.env.E2E_RECEIVER_URL ?? 'http://localhost:4200';
+  const me = await (await page.request.get(`${apiUrl}/auth/me`)).json();
+  const headers = { Origin: 'http://localhost:3000', 'X-Organization-Id': me.organizations[0].id };
+  const endpoint = await (
+    await page.request.post(`${apiUrl}/endpoints`, {
+      headers,
+      data: {
+        name: 'Tools receiver',
+        url: `${receiver}/webhooks/success`,
+        eventTypes: ['tools.test'],
+      },
+    })
+  ).json();
+  // Reload to fetch the endpoint created through the API.
+  await page.reload();
+  await page.getByRole('button', { name: 'Testing', exact: true }).click();
+  await page.getByLabel('Test endpoint', { exact: true }).selectOption(endpoint.id);
+  await page.getByLabel('Payload template').selectOption('order');
+  await page.getByRole('button', { name: 'Send test webhook' }).click();
+  await expect(page.getByText(/HTTP 200 · .* · delivered/)).toBeVisible();
+  await expect(page.getByLabel('Webhook signature')).not.toHaveValue('');
+  await page.getByRole('button', { name: 'Verify signature', exact: true }).click();
+  await expect(page.getByText('Valid signature and timestamp', { exact: true })).toBeVisible();
+  await page.getByLabel('Exact raw request body').fill('{"tampered":true}');
+  await page.getByRole('button', { name: 'Verify signature', exact: true }).click();
+  await expect(
+    page.getByText('Verification failed: signature invalid, timestamp valid'),
+  ).toBeVisible();
+  await page.screenshot({ path: 'work/testing-desktop.png', fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollWidth))
+    .toBeLessThanOrEqual(390);
+  await page.screenshot({ path: 'work/testing-mobile.png', fullPage: true });
+  await page.setViewportSize({ width: 1280, height: 800 });
+
+  await page.getByRole('button', { name: 'API keys', exact: true }).click();
+  await page.getByRole('button', { name: 'Create API key' }).click();
+  await page.getByLabel('Name', { exact: true }).fill('Read-only operations');
+  await page.getByLabel('events:publish', { exact: true }).uncheck();
+  await page.getByLabel('events:read', { exact: true }).check();
+  await page.getByLabel('Allowed event types (comma separated)').fill('tools.test');
+  await page.getByLabel('Key expiry').selectOption('7');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await expect(page.getByRole('heading', { name: 'API key', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Close dialog' }).click();
+  const keyRow = page.getByRole('row').filter({ hasText: 'Read-only operations' });
+  await expect(keyRow.getByText('events:read', { exact: true })).toBeVisible();
+  await expect(keyRow.getByText('tools.test', { exact: true })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByLabel('Event retention (days)').fill('30');
+  await page.getByLabel('Attempt retention (days)').fill('7');
+  await page.getByRole('button', { name: 'Save retention policy' }).click();
+  await expect(
+    page.getByText('Policy saved. Automatic cleanup runs in bounded batches.'),
+  ).toBeVisible();
+  await page.getByRole('button', { name: 'Run cleanup now' }).click();
+  await page.getByRole('button', { name: 'Confirm cleanup' }).click();
+  await expect(page.getByText('Removed 0 events and 0 attempts.')).toBeVisible();
+  await page.screenshot({ path: 'work/retention-desktop.png', fullPage: true });
+
+  const failing = await (
+    await page.request.post(`${apiUrl}/endpoints`, {
+      headers,
+      data: {
+        name: 'Alert receiver',
+        url: `${receiver}/webhooks/reject`,
+        eventTypes: ['alerts.test'],
+      },
+    })
+  ).json();
+  await page.reload();
+  await page.getByRole('button', { name: 'Alerts', exact: true }).click();
+  await page.getByRole('button', { name: 'Add alert rule' }).click();
+  await page.getByLabel('Rule name').fill('Receiver failures');
+  await page.getByLabel('Monitored endpoint').selectOption(failing.id);
+  await page.getByLabel('Notification endpoint').selectOption(endpoint.id);
+  await page.getByLabel('Failure threshold').fill('1');
+  await page.getByRole('button', { name: 'Save alert rule' }).click();
+  await expect(page.getByText('Receiver failures', { exact: true })).toBeVisible();
+  const event = await (
+    await page.request.post(`${apiUrl}/events`, {
+      headers: { ...headers, 'Idempotency-Key': 'alert-browser-event' },
+      data: { type: 'alerts.test', payload: { test: true } },
+    })
+  ).json();
+  const incident = page
+    .locator('article')
+    .filter({ hasText: 'Alert receiver · Receiver failures' });
+  await expect(incident.getByText('Open', { exact: true })).toBeVisible({ timeout: 30000 });
+  await expect(incident.getByText('opened notification: delivered')).toBeVisible();
+  await incident.getByRole('button', { name: 'Acknowledge' }).click();
+  await expect(incident.getByText(/Acknowledged/)).toBeVisible();
+  await page.screenshot({ path: 'work/alerts-desktop.png', fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollWidth))
+    .toBeLessThanOrEqual(390);
+  await page.screenshot({ path: 'work/alerts-mobile.png', fullPage: true });
+  expect(
+    (
+      await page.request.patch(`${apiUrl}/endpoints/${failing.id}`, {
+        headers,
+        data: { url: `${receiver}/webhooks/success` },
+      })
+    ).status(),
+  ).toBe(200);
+  expect(
+    (
+      await page.request.post(`${apiUrl}/deliveries/${event.deliveries[0].id}/replay`, { headers })
+    ).status(),
+  ).toBe(201);
+  await expect(incident.getByText('Resolved', { exact: true })).toBeVisible({ timeout: 30000 });
+  await expect(incident.getByText('resolved notification: delivered')).toBeVisible();
+  expect(errors).toEqual([]);
+});

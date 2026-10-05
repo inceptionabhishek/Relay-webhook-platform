@@ -67,3 +67,24 @@ describe('Delivery policies and security', () => {
     await expect(resolveDestination('http://169.254.169.254/latest')).rejects.toThrow();
   });
 });
+
+import { verifyWebhook } from '../src/testing';
+test('signature verifier rejects tampering and malformed hashes and separates timestamp validity', () => {
+  const endpoint = {
+    secretEncrypted: encrypt('secret'),
+    previousSecretEncrypted: null,
+    previousSecretUntil: null,
+  };
+  const input = { eventId: 'event', timestamp: '1000', rawBody: '{"ok":true}', signature: '' };
+  input.signature = `v1=${signature('secret', input.eventId, input.timestamp, input.rawBody)}`;
+  expect(verifyWebhook(input, endpoint, 1000000).valid).toBe(true);
+  expect(verifyWebhook(input, endpoint, 1400000)).toEqual({
+    valid: false,
+    signatureValid: true,
+    timestampValid: false,
+  });
+  expect(verifyWebhook({ ...input, rawBody: '{"ok":false}' }, endpoint, 1000000).valid).toBe(false);
+  expect(verifyWebhook({ ...input, signature: 'v1=zz' }, endpoint, 1000000).signatureValid).toBe(
+    false,
+  );
+});

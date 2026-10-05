@@ -770,3 +770,387 @@ test('bulk replay runs in bounded durable chunks and resumes remaining items', a
     ).status,
   ).toBe(403);
 });
+
+test('scoped keys enforce permissions, event types, expiry, workspace binding and rotation', async () => {
+  const { event, delivery } = await publish();
+  const read = await auth('post', '/keys').send({
+    name: 'reader',
+    scopes: ['events:read'],
+    expiresAt: new Date(Date.now() + 60000).toISOString(),
+  });
+  expect(read.status).toBe(201);
+  const withKey = (method: 'get' | 'post', path: string, secret = read.body.secret) =>
+    request(app.getHttpServer())[method](path).set('Authorization', `Bearer ${secret}`);
+  expect((await withKey('get', `/events/${event.id}`)).status).toBe(200);
+  expect((await withKey('get', '/endpoints')).status).toBe(403);
+  expect(
+    (
+      await withKey('post', '/events')
+        .set('Idempotency-Key', randomUUID())
+        .send({ type: 'order.created', payload: {} })
+    ).status,
+  ).toBe(403);
+  expect(
+    (await withKey('post', '/keys').send({ name: 'escalate', scopes: ['events:publish'] })).status,
+  ).toBe(403);
+  expect((await withKey('get', '/events').set('X-Organization-Id', randomUUID())).status).toBe(403);
+  const publishKey = await auth('post', '/keys').send({
+    name: 'orders',
+    scopes: ['events:publish'],
+    eventTypes: ['order.created'],
+  });
+  expect(
+    (
+      await withKey('post', '/events', publishKey.body.secret)
+        .set('Idempotency-Key', randomUUID())
+        .send({ type: 'user.created', payload: {} })
+    ).status,
+  ).toBe(403);
+  expect(
+    (
+      await withKey('post', '/events', publishKey.body.secret)
+        .set('Idempotency-Key', randomUUID())
+        .send({ type: 'order.created', payload: {} })
+    ).status,
+  ).toBe(201);
+  await processDelivery({ deliveryId: delivery.id, generation: 0 });
+  const replayKey = await auth('post', '/keys').send({
+    name: 'replayer',
+    scopes: ['deliveries:replay'],
+  });
+  expect(
+    (await withKey('post', `/deliveries/${delivery.id}/replay`, replayKey.body.secret).send({}))
+      .status,
+  ).toBe(201);
+  expect((await withKey('get', '/events', replayKey.body.secret)).status).toBe(403);
+  const rotated = await auth('post', `/keys/${publishKey.body.id}/rotate`).send({});
+  expect(rotated.body.scopes).toEqual(['events:publish']);
+  expect(rotated.body.eventTypes).toEqual(['order.created']);
+  expect(
+    (
+      await withKey('post', '/events', publishKey.body.secret)
+        .set('Idempotency-Key', randomUUID())
+        .send({ type: 'order.created', payload: {} })
+    ).status,
+  ).toBe(401);
+  await db.apiKey.update({ where: { id: read.body.id }, data: { expiresAt: new Date(0) } });
+  expect((await withKey('get', '/events')).status).toBe(401);
+  expect((await auth('post', '/keys').send({ name: 'bad', scopes: ['admin'] })).status).toBe(400);
+  expect((await auth('post', '/keys').send({ name: 'bad', scopes: [] })).status).toBe(400);
+});
+test('targeted testing records signed diagnostics and verifies exact bodies without production statistics', async () => {
+  const first = await auth('post', '/endpoints').send({
+    name: 'test only',
+    url: `${receiverUrl}/success`,
+    eventTypes: ['something.else'],
+  });
+  await auth('post', '/endpoints').send({ name: 'other', url: `${receiverUrl}/success` });
+  const result = await auth('post', '/testing/events')
+    .set('Idempotency-Key', randomUUID())
+    .send({ endpointId: first.body.id, type: 'order.created', payload: { test: true } });
+  expect(result.status).toBe(201);
+  expect(result.body.source).toBe('test');
+  expect(result.body.deliveries).toHaveLength(1);
+  const delivery = result.body.deliveries[0];
+  await processDelivery({ deliveryId: delivery.id, generation: 0 });
+  const detail = await auth('get', `/testing/events/${result.body.id}`);
+  const attempt = detail.body.deliveries[0].attempts[0];
+  expect(attempt.requestHeaders['webhook-test']).toBe('true');
+  expect(attempt.requestBody).toBeTruthy();
+  const verification = {
+    endpointId: first.body.id,
+    eventId: result.body.id,
+    timestamp: attempt.requestHeaders['webhook-timestamp'],
+    signature: attempt.requestHeaders['webhook-signature'],
+    rawBody: attempt.requestBody,
+  };
+  expect((await auth('post', '/testing/verify-signature').send(verification)).body.valid).toBe(
+    true,
+  );
+  expect(
+    (
+      await auth('post', '/testing/verify-signature').send({
+        ...verification,
+        rawBody: `${attempt.requestBody} `,
+      })
+    ).body.signatureValid,
+  ).toBe(false);
+  await auth('post', `/endpoints/${first.body.id}/rotate-secret`).send({});
+  expect((await auth('post', '/testing/verify-signature').send(verification)).body.valid).toBe(
+    true,
+  );
+  expect((await auth('get', '/stats')).body.events).toBe(0);
+  const tester = await auth('post', '/keys').send({
+    name: 'tester',
+    scopes: ['testing:write'],
+    eventTypes: ['custom.test'],
+  });
+  const denied = await request(app.getHttpServer())
+    .post('/testing/events')
+    .set('Authorization', `Bearer ${tester.body.secret}`)
+    .set('Idempotency-Key', randomUUID())
+    .send({ endpointId: first.body.id, type: 'order.created', payload: {} });
+  expect(denied.status).toBe(403);
+  await freshWorkspace();
+  expect((await auth('get', `/testing/events/${result.body.id}`)).status).toBe(404);
+  expect((await auth('post', '/testing/verify-signature').send(verification)).status).toBe(404);
+});
+test('delivery alerts deduplicate incidents, send signed opening/recovery notifications and apply cooldown', async () => {
+  const { evaluateAlertRule } = await import('../src/alerts');
+  const { endpoint, deliveries } = await endpointEvents('reject', 3);
+  const notification = await auth('post', '/endpoints').send({
+    name: 'notifications',
+    url: `${receiverUrl}/success`,
+    eventTypes: ['relay.alert.opened', 'relay.alert.resolved'],
+  });
+  const rule = await auth('post', '/alert-rules').send({
+    name: 'Receiver failures',
+    endpointId: endpoint.id,
+    notificationEndpointId: notification.body.id,
+    threshold: 2,
+  });
+  expect(rule.status).toBe(201);
+  for (const delivery of deliveries)
+    await processDelivery({ deliveryId: delivery.id, generation: 0 });
+  await Promise.all([evaluateAlertRule(rule.body.id), evaluateAlertRule(rule.body.id)]);
+  const opened = (await auth('get', '/alerts?status=open')).body.items;
+  expect(opened).toHaveLength(1);
+  expect(opened[0].failureCount).toBe(3);
+  expect(opened[0].notifications).toHaveLength(1);
+  const notice = opened[0].notifications[0].event;
+  const noticeDelivery = await db.delivery.findFirstOrThrow({ where: { eventId: notice.id } });
+  await processDelivery({ deliveryId: noticeDelivery.id, generation: 0 });
+  expect((await db.event.findUniqueOrThrow({ where: { id: notice.id } })).source).toBe('alert');
+  await evaluateAlertRule(rule.body.id);
+  expect(await db.alert.count({ where: { ruleId: rule.body.id } })).toBe(1);
+  await auth('post', `/alerts/${opened[0].id}/acknowledge`).send({});
+  expect((await auth('get', '/alerts')).body.items[0].acknowledgedAt).toBeTruthy();
+  await auth('patch', `/endpoints/${endpoint.id}`).send({ url: `${receiverUrl}/success` });
+  await auth('post', `/deliveries/${deliveries[0].id}/replay`).send({});
+  await processDelivery({ deliveryId: deliveries[0].id, generation: 1 });
+  await evaluateAlertRule(rule.body.id);
+  const resolved = (await auth('get', '/alerts?status=resolved')).body.items[0];
+  expect(resolved.message).toBe('Endpoint recovered');
+  expect(resolved.notifications).toHaveLength(2);
+  await auth('patch', `/endpoints/${endpoint.id}`).send({ url: `${receiverUrl}/reject` });
+  for (let i = 0; i < 2; i++) {
+    const event = await auth('post', '/events')
+      .set('Idempotency-Key', randomUUID())
+      .send({ type: 'operations.test', payload: { i } });
+    await processDelivery({
+      deliveryId: event.body.deliveries.find((d: any) => d.endpointId === endpoint.id).id,
+      generation: 0,
+    });
+  }
+  await evaluateAlertRule(rule.body.id);
+  expect(await db.alert.count({ where: { ruleId: rule.body.id } })).toBe(1);
+  await db.alert.update({
+    where: { id: opened[0].id },
+    data: { createdAt: new Date(Date.now() - 31 * 60000) },
+  });
+  await evaluateAlertRule(rule.body.id);
+  expect(await db.alert.count({ where: { ruleId: rule.body.id } })).toBe(2);
+  await freshWorkspace();
+  expect((await auth('post', `/alerts/${opened[0].id}/acknowledge`).send({})).status).toBe(404);
+  expect(
+    (await auth('patch', `/alert-rules/${rule.body.id}`).send({ enabled: false })).status,
+  ).toBe(404);
+});
+test('test and notification failures do not recursively trigger alerts; failure window and rule changes resolve incidents', async () => {
+  const { evaluateAlertRule } = await import('../src/alerts');
+  const endpoint = await auth('post', '/endpoints').send({
+    name: 'test',
+    url: `${receiverUrl}/reject`,
+  });
+  const rule = await auth('post', '/alert-rules').send({
+    name: 'Noise protection',
+    threshold: 1,
+    windowMinutes: 1,
+  });
+  const sample = await auth('post', '/testing/events')
+    .set('Idempotency-Key', randomUUID())
+    .send({ endpointId: endpoint.body.id, type: 'test.fail', payload: {} });
+  await processDelivery({ deliveryId: sample.body.deliveries[0].id, generation: 0 });
+  await evaluateAlertRule(rule.body.id);
+  expect(await db.alert.count({ where: { ruleId: rule.body.id } })).toBe(0);
+  const notificationEvent = await db.event.create({
+    data: {
+      organizationId: org,
+      source: 'alert',
+      type: 'relay.alert.opened',
+      payload: {},
+      idempotencyKey: randomUUID(),
+      requestHash: 'test',
+      deliveries: { create: { endpointId: endpoint.body.id } },
+    },
+    include: { deliveries: true },
+  });
+  await processDelivery({ deliveryId: notificationEvent.deliveries[0].id, generation: 0 });
+  await evaluateAlertRule(rule.body.id);
+  expect(await db.alert.count({ where: { ruleId: rule.body.id } })).toBe(0);
+  const production = await auth('post', '/events')
+    .set('Idempotency-Key', randomUUID())
+    .send({ type: 'live.fail', payload: {} });
+  await processDelivery({ deliveryId: production.body.deliveries[0].id, generation: 0 });
+  await evaluateAlertRule(rule.body.id);
+  expect(await db.alert.count({ where: { ruleId: rule.body.id, resolvedAt: null } })).toBe(1);
+  await evaluateAlertRule(rule.body.id, new Date(Date.now() + 61000));
+  const cleared = await db.alert.findFirstOrThrow({ where: { ruleId: rule.body.id } });
+  expect(cleared.resolvedAt).not.toBeNull();
+  expect(cleared.message).toBe('Failure window cleared');
+  await db.alert.update({ where: { id: cleared.id }, data: { createdAt: new Date(0) } });
+  await evaluateAlertRule(rule.body.id);
+  expect(await db.alert.count({ where: { ruleId: rule.body.id, resolvedAt: null } })).toBe(1);
+  await auth('patch', `/alert-rules/${rule.body.id}`).send({ endpointId: endpoint.body.id });
+  expect(await db.alert.count({ where: { ruleId: rule.body.id, resolvedAt: null } })).toBe(0);
+  await db.alert.updateMany({ where: { ruleId: rule.body.id }, data: { createdAt: new Date(0) } });
+  await evaluateAlertRule(rule.body.id);
+  expect(await db.alert.count({ where: { ruleId: rule.body.id, resolvedAt: null } })).toBe(1);
+  await auth('patch', `/alert-rules/${rule.body.id}`).send({ enabled: false });
+  expect(await db.alert.count({ where: { ruleId: rule.body.id, resolvedAt: null } })).toBe(0);
+});
+
+test('concurrent key rotations create one successor and member sessions cannot change workspace policies', async () => {
+  const key = await auth('post', '/keys').send({
+    name: 'Rotating reader',
+    scopes: ['events:read', 'endpoints:read'],
+    expiresAt: new Date(Date.now() + 60000).toISOString(),
+  });
+  const rotations = await Promise.all([
+    auth('post', `/keys/${key.body.id}/rotate`).send({}),
+    auth('post', `/keys/${key.body.id}/rotate`).send({}),
+  ]);
+  expect(rotations.map((r) => r.status).sort()).toEqual([201, 404]);
+  const successor = rotations.find((r) => r.status === 201)!;
+  expect(successor.body.expiresAt).toBe(key.body.expiresAt);
+  expect(await db.apiKey.count({ where: { organizationId: org, revokedAt: null } })).toBe(1);
+  const owner = await auth('get', '/members');
+  await db.membership.update({
+    where: { userId_organizationId: { userId: owner.body[0].user.id, organizationId: org } },
+    data: { role: 'member' },
+  });
+  expect((await auth('get', '/settings/retention')).status).toBe(200);
+  expect(
+    (
+      await auth('patch', '/settings/retention').send({
+        eventRetentionDays: 7,
+        attemptRetentionDays: null,
+      })
+    ).status,
+  ).toBe(403);
+  expect((await auth('post', '/settings/retention/run').send({})).status).toBe(403);
+  expect((await auth('post', '/alert-rules').send({ name: 'Escalate' })).status).toBe(403);
+  expect((await auth('post', '/keys').send({ name: 'Escalate' })).status).toBe(403);
+});
+async function ageEvent(eventId: string, days: number, status = 'delivered') {
+  const date = new Date(Date.now() - days * 86400000);
+  await db.event.update({ where: { id: eventId }, data: { createdAt: date } });
+  await db.delivery.updateMany({
+    where: { eventId },
+    data: { status, createdAt: date, finishedAt: date },
+  });
+  await db.attempt.updateMany({ where: { delivery: { eventId } }, data: { createdAt: date } });
+}
+test('retention deletes terminal history, protects active/replay work and prevents expired idempotency reuse', async () => {
+  const { cleanupWorkspace } = await import('../src/retention');
+  const { processReplayBatches } = await import('../src/replay');
+  const { event, delivery } = await publish('reject');
+  await processDelivery({ deliveryId: delivery.id, generation: 0 });
+  const batch = await auth('post', '/replay-batches')
+    .set('Idempotency-Key', randomUUID())
+    .send({ deliveryIds: [delivery.id] });
+  await ageEvent(event.id, 10, 'failed');
+  await auth('patch', '/settings/retention').send({
+    eventRetentionDays: 7,
+    attemptRetentionDays: 3,
+  });
+  expect((await cleanupWorkspace(org)).eventsDeleted).toBe(0); // queued replay remains protected
+  await processReplayBatches();
+  expect((await cleanupWorkspace(org)).eventsDeleted).toBe(0); // active replay
+  await processDelivery({ deliveryId: delivery.id, generation: 1 });
+  expect((await cleanupWorkspace(org)).eventsDeleted).toBe(0); // recent completion
+  await ageEvent(event.id, 10, 'failed');
+  const preview = await auth('get', '/settings/retention');
+  expect(preview.body.eligibleEvents).toBe(1);
+  const removed = await cleanupWorkspace(org);
+  expect(removed.eventsDeleted).toBe(1);
+  expect(removed.attemptsDeleted).toBe(2);
+  expect(await db.event.findUnique({ where: { id: event.id } })).toBeNull();
+  const progress = await auth('get', `/replay-batches/${batch.body.id}`);
+  expect(progress.body.total).toBe(1);
+  expect(progress.body.outcomes.expired).toBe(1);
+  expect(progress.body.items[0].deliveryId).toBe(delivery.id);
+  expect((await auth('get', `/events/${event.id}`)).status).toBe(410);
+  const expired = await auth('post', '/events')
+    .set('Idempotency-Key', event.idempotencyKey)
+    .send({ type: event.type, payload: event.payload });
+  expect(expired.status).toBe(410);
+  expect(
+    (
+      await auth('post', '/events')
+        .set('Idempotency-Key', event.idempotencyKey)
+        .send({ type: event.type, payload: { different: true } })
+    ).status,
+  ).toBe(409);
+  expect((await cleanupWorkspace(org)).eventsDeleted).toBe(0);
+});
+test('attempt-only retention preserves event metadata and protects leases and nonterminal deliveries', async () => {
+  const { cleanupWorkspace } = await import('../src/retention');
+  const { event, delivery } = await publish();
+  await processDelivery({ deliveryId: delivery.id, generation: 0 });
+  await ageEvent(event.id, 10);
+  await auth('patch', '/settings/retention').send({
+    eventRetentionDays: null,
+    attemptRetentionDays: 3,
+  });
+  await db.delivery.update({
+    where: { id: delivery.id },
+    data: { leaseUntil: new Date(Date.now() + 60000) },
+  });
+  expect((await cleanupWorkspace(org)).attemptsDeleted).toBe(0);
+  await db.delivery.update({
+    where: { id: delivery.id },
+    data: { leaseUntil: null, status: 'pending' },
+  });
+  expect((await cleanupWorkspace(org)).attemptsDeleted).toBe(0);
+  await db.delivery.update({ where: { id: delivery.id }, data: { status: 'delivered' } });
+  expect((await cleanupWorkspace(org)).attemptsDeleted).toBe(1);
+  expect(await db.event.findUnique({ where: { id: event.id } })).not.toBeNull();
+  expect(
+    (
+      await auth('patch', '/settings/retention').send({
+        eventRetentionDays: 2,
+        attemptRetentionDays: 3,
+      })
+    ).status,
+  ).toBe(400);
+});
+test('retention respects concurrent delivery claims and concurrent cleanup commits only one expiry record', async () => {
+  const { cleanupWorkspace } = await import('../src/retention');
+  const { event, delivery } = await publish();
+  await processDelivery({ deliveryId: delivery.id, generation: 0 });
+  await ageEvent(event.id, 10);
+  await auth('patch', '/settings/retention').send({
+    eventRetentionDays: 7,
+    attemptRetentionDays: null,
+  });
+  let release!: () => void;
+  let ready!: () => void;
+  const locked = new Promise<void>((r) => (ready = r));
+  const wait = new Promise<void>((r) => (release = r));
+  const transaction = db.$transaction(
+    async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Delivery" WHERE id = ${delivery.id} FOR UPDATE`;
+      ready();
+      await wait;
+    },
+    { timeout: 10000 },
+  );
+  await locked;
+  expect((await cleanupWorkspace(org)).eventsDeleted).toBe(0);
+  release();
+  await transaction;
+  const results = await Promise.all([cleanupWorkspace(org), cleanupWorkspace(org)]);
+  expect(results.reduce((sum, r) => sum + r.eventsDeleted, 0)).toBe(1);
+  expect(await db.expiredEvent.count({ where: { eventId: event.id } })).toBe(1);
+});
