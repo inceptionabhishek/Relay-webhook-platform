@@ -17,6 +17,8 @@ export type Principal = {
   role: string;
   userId?: string;
   expiresAt?: Date;
+  scopes?: string[];
+  eventTypes?: string[];
 };
 export type AuthRequest = Request & { principal: Principal };
 @Injectable()
@@ -26,12 +28,28 @@ export class AuthGuard implements CanActivate {
     const bearer = req.headers.authorization?.replace(/^Bearer /, '');
     if (bearer) {
       const key = await db.apiKey.findUnique({ where: { tokenHash: hash(bearer) } });
-      if (!key || key.revokedAt) throw new UnauthorizedException('Invalid API key');
+      if (!key || key.revokedAt || (key.expiresAt && key.expiresAt <= new Date()))
+        throw new UnauthorizedException('Invalid API key');
       req.principal = {
         organizationId: key.organizationId,
         actor: `key:${key.id}`,
-        role: 'ingest',
+        role: 'api_key',
+        scopes: key.scopes,
+        eventTypes: key.eventTypes,
+        expiresAt: key.expiresAt ?? undefined,
       };
+      if (
+        req.headers['x-organization-id'] &&
+        req.headers['x-organization-id'] !== key.organizationId
+      )
+        throw new ForbiddenException('API key belongs to a different workspace');
+      await db.apiKey.updateMany({
+        where: {
+          id: key.id,
+          OR: [{ lastUsedAt: null }, { lastUsedAt: { lt: new Date(Date.now() - 300000) } }],
+        },
+        data: { lastUsedAt: new Date() },
+      });
     } else {
       const session =
         req.cookies?.relay_session &&
@@ -76,8 +94,8 @@ export class AuthGuard implements CanActivate {
   }
 }
 export function browserOnly(req: AuthRequest) {
-  if (req.principal.role === 'ingest')
-    throw new ForbiddenException('This API key can only publish events');
+  if (req.principal.role === 'api_key')
+    throw new ForbiddenException('This action requires a browser session');
 }
 export function ownerOnly(req: AuthRequest) {
   if (req.principal.role !== 'owner')

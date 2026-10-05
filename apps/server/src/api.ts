@@ -19,14 +19,13 @@ import {
   ServiceUnavailableException,
   HttpException,
   HttpCode,
+  GoneException,
 } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiHeader, ApiBody, ApiOperation } from '@nestjs/swagger';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { interval, from, concat, exhaustMap, map, takeWhile } from 'rxjs';
 import { db } from './db';
-import { context, propagation } from '@opentelemetry/api';
-import { Prisma } from './generated/prisma/client';
 import { token, hash, passwordHash, verifyPassword, encrypt } from './crypto';
 import { AuthGuard, AuthRequest, browserOnly, ownerOnly, sessionUser } from './auth';
 import { config } from './config';
@@ -34,6 +33,8 @@ import { resolveDestination } from './destination';
 import { rateLimit } from './queue';
 import { circuitStates, requestProbe } from './circuit';
 import { createReplayBatch, replayBatchSummary, resetDelivery } from './replay';
+import { requireScope, requireEventType, API_SCOPES } from './permissions';
+import { acceptEvent } from './events';
 const email = z
   .string()
   .email()
@@ -219,7 +220,7 @@ export class AuthController {
 export class PlatformController {
   @Get('endpoints')
   async endpoints(@Req() req: AuthRequest) {
-    browserOnly(req);
+    requireScope(req, 'endpoints:read');
     const endpoints = await db.endpoint.findMany({
       where: { organizationId: req.principal.organizationId },
       orderBy: { createdAt: 'desc' },
@@ -286,7 +287,7 @@ export class PlatformController {
   }
   @Get('endpoints/:id/circuit-history')
   async circuitHistory(@Param('id') endpointId: string, @Req() req: AuthRequest) {
-    browserOnly(req);
+    requireScope(req, 'endpoints:read');
     const endpoint = await db.endpoint.findFirst({
       where: { id: id(endpointId), organizationId: req.principal.organizationId },
     });
@@ -368,25 +369,102 @@ export class PlatformController {
     ownerOnly(req);
     return db.apiKey.findMany({
       where: { organizationId: req.principal.organizationId },
-      select: { id: true, name: true, prefix: true, createdAt: true, revokedAt: true },
+      select: {
+        id: true,
+        name: true,
+        prefix: true,
+        createdAt: true,
+        revokedAt: true,
+        scopes: true,
+        eventTypes: true,
+        expiresAt: true,
+        lastUsedAt: true,
+      },
       orderBy: { createdAt: 'desc' },
     });
   }
   @Post('keys')
+  @ApiOperation({
+    summary: 'Create an owner-managed key with explicit permissions and optional expiry',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['name'],
+      properties: {
+        name: { type: 'string' },
+        scopes: {
+          type: 'array',
+          minItems: 1,
+          items: { type: 'string', enum: [...API_SCOPES] },
+          default: ['events:publish'],
+        },
+        eventTypes: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Exact allowed publish/test event types; empty allows all',
+        },
+        expiresAt: {
+          type: 'string',
+          format: 'date-time',
+          nullable: true,
+          description: 'Expiry within 365 days, or null for no expiry',
+        },
+      },
+    },
+  })
   async createKey(@Body() body: unknown, @Req() req: AuthRequest) {
     ownerOnly(req);
-    const data = z.object({ name }).parse(body);
+    const data = z
+      .object({
+        name,
+        scopes: z
+          .array(z.enum(API_SCOPES))
+          .min(1)
+          .max(API_SCOPES.length)
+          .default(['events:publish']),
+        eventTypes: z
+          .array(
+            z
+              .string()
+              .regex(/^[a-zA-Z0-9_.-]+$/)
+              .max(100),
+          )
+          .max(50)
+          .default([]),
+        expiresAt: z
+          .string()
+          .datetime()
+          .nullable()
+          .default(null)
+          .refine(
+            (v) =>
+              !v || (Date.parse(v) > Date.now() && Date.parse(v) <= Date.now() + 365 * 86400000),
+            'Expiry must be in the next 365 days',
+          ),
+      })
+      .parse(body);
     const secret = token('rk_live_');
     const key = await db.apiKey.create({
       data: {
         name: data.name,
+        scopes: [...new Set(data.scopes)],
+        eventTypes: [...new Set(data.eventTypes)],
+        expiresAt: data.expiresAt ? new Date(data.expiresAt) : null,
         organizationId: req.principal.organizationId,
         prefix: secret.slice(0, 16),
         tokenHash: hash(secret),
       },
     });
     await audit(req, 'key.created', key.id);
-    return { id: key.id, secret, prefix: key.prefix };
+    return {
+      id: key.id,
+      secret,
+      prefix: key.prefix,
+      scopes: key.scopes,
+      eventTypes: key.eventTypes,
+      expiresAt: key.expiresAt,
+    };
   }
   @Delete('keys/:id')
   async revokeKey(@Param('id') keyId: string, @Req() req: AuthRequest) {
@@ -404,14 +482,23 @@ export class PlatformController {
     ownerOnly(req);
     const secret = token('rk_live_');
     const result = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "ApiKey" WHERE id = ${id(keyId)} AND "organizationId" = ${req.principal.organizationId} FOR UPDATE`;
       const key = await tx.apiKey.findFirst({
-        where: { id: id(keyId), organizationId: req.principal.organizationId, revokedAt: null },
+        where: {
+          id: id(keyId),
+          organizationId: req.principal.organizationId,
+          revokedAt: null,
+          OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+        },
       });
       if (!key) throw new NotFoundException('Active API key not found');
       await tx.apiKey.update({ where: { id: keyId }, data: { revokedAt: new Date() } });
       const next = await tx.apiKey.create({
         data: {
           name: key.name,
+          scopes: key.scopes,
+          eventTypes: key.eventTypes,
+          expiresAt: key.expiresAt,
           organizationId: key.organizationId,
           prefix: secret.slice(0, 16),
           tokenHash: hash(secret),
@@ -425,7 +512,14 @@ export class PlatformController {
           resourceId: next.id,
         },
       });
-      return { id: next.id, prefix: next.prefix, secret };
+      return {
+        id: next.id,
+        prefix: next.prefix,
+        secret,
+        scopes: next.scopes,
+        eventTypes: next.eventTypes,
+        expiresAt: next.expiresAt,
+      };
     });
     return result;
   }
@@ -445,6 +539,7 @@ export class PlatformController {
     },
   })
   async publish(@Body() body: unknown, @Req() req: AuthRequest) {
+    requireScope(req, 'events:publish');
     const data = z
       .object({
         type: z
@@ -454,75 +549,17 @@ export class PlatformController {
         payload: z.record(z.string(), z.unknown()),
       })
       .parse(body);
-    const idempotencyKey = z.string().min(1).max(200).parse(req.headers['idempotency-key']);
-    const requestHash = hash(JSON.stringify(data));
-    const traceContext: Record<string, string> = {};
-    propagation.inject(context.active(), traceContext);
-    const organizationId = req.principal.organizationId;
-    const existing = () =>
-      db.event.findUnique({
-        where: { organizationId_idempotencyKey: { organizationId, idempotencyKey } },
-        include: { deliveries: true },
-      });
-    const check = (event: any) => {
-      if (event.requestHash !== requestHash)
-        throw new ConflictException('Idempotency key already used with a different request');
-      return event;
-    };
-    const previous = await existing();
-    if (previous) return check(previous);
-    try {
-      return await db.$transaction(async (tx) => {
-        const endpoints = await tx.endpoint.findMany({
-          where: {
-            organizationId,
-            enabled: true,
-            OR: [{ eventTypes: { isEmpty: true } }, { eventTypes: { has: data.type } }],
-          },
-        });
-        const event = await tx.event.create({
-          data: {
-            organizationId,
-            idempotencyKey,
-            requestHash,
-            traceContext,
-            type: data.type,
-            payload: data.payload as Prisma.InputJsonValue,
-          },
-        });
-        for (const endpoint of endpoints) {
-          await tx.delivery.create({
-            data: {
-              eventId: event.id,
-              endpointId: endpoint.id,
-              outbox: { create: { generation: 0, sequence: 0 } },
-            },
-          });
-        }
-        await tx.auditLog.create({
-          data: {
-            organizationId,
-            actor: req.principal.actor,
-            action: 'event.published',
-            resourceId: event.id,
-          },
-        });
-        return tx.event.findUniqueOrThrow({
-          where: { id: event.id },
-          include: { deliveries: true },
-        });
-      });
-    } catch (error) {
-      if ((error as any).code === 'P2002') {
-        const event = await existing();
-        if (event) return check(event);
-      }
-      throw error;
-    }
+    requireEventType(req, data.type);
+    return acceptEvent({
+      ...data,
+      organizationId: req.principal.organizationId,
+      actor: req.principal.actor,
+      idempotencyKey: z.string().min(1).max(200).parse(req.headers['idempotency-key']),
+    });
   }
   @Get('events')
   async events(@Req() req: AuthRequest, @Query() query: Record<string, string>) {
-    browserOnly(req);
+    requireScope(req, 'events:read');
     const limit = z.coerce.number().int().min(1).max(100).default(25).parse(query.limit);
     const status = z
       .enum(['pending', 'processing', 'retrying', 'throttled', 'paused', 'delivered', 'failed'])
@@ -556,7 +593,7 @@ export class PlatformController {
   }
   @Get('events/:id')
   async event(@Param('id') eventId: string, @Req() req: AuthRequest) {
-    browserOnly(req);
+    requireScope(req, 'events:read');
     const event = await db.event.findFirst({
       where: { id: id(eventId), organizationId: req.principal.organizationId },
       include: {
@@ -568,12 +605,20 @@ export class PlatformController {
         },
       },
     });
-    if (!event) throw new NotFoundException('Event not found');
+    if (!event) {
+      if (
+        await db.expiredEvent.findFirst({
+          where: { eventId, organizationId: req.principal.organizationId },
+        })
+      )
+        throw new GoneException('Event expired under the workspace retention policy');
+      throw new NotFoundException('Event not found');
+    }
     return event;
   }
   @Post('deliveries/:id/replay')
   async replay(@Param('id') deliveryId: string, @Req() req: AuthRequest) {
-    browserOnly(req);
+    requireScope(req, 'deliveries:replay');
     return db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "Delivery" WHERE id = ${id(deliveryId)} FOR UPDATE`;
       const delivery = await tx.delivery.findFirst({
@@ -601,7 +646,7 @@ export class PlatformController {
   @Get('failures')
   @ApiOperation({ summary: 'List failed deliveries with endpoint and event filters' })
   async failures(@Req() req: AuthRequest, @Query() query: Record<string, string>) {
-    browserOnly(req);
+    requireScope(req, 'events:read');
     const limit = z.coerce.number().int().min(1).max(100).default(25).parse(query.limit);
     const endpointId = query.endpointId ? id(query.endpointId) : undefined;
     const cursor = query.cursor ? id(query.cursor) : undefined;
@@ -659,7 +704,7 @@ export class PlatformController {
     },
   })
   async bulkReplay(@Req() req: AuthRequest, @Body() body: unknown) {
-    browserOnly(req);
+    requireScope(req, 'deliveries:replay');
     const { deliveryIds } = z
       .object({ deliveryIds: z.array(z.string().uuid()).min(1).max(500) })
       .parse(body);
@@ -674,7 +719,7 @@ export class PlatformController {
   }
   @Get('replay-batches')
   async replayBatches(@Req() req: AuthRequest) {
-    browserOnly(req);
+    requireScope(req, 'deliveries:replay');
     const batches = await db.replayBatch.findMany({
       where: { organizationId: req.principal.organizationId },
       orderBy: { createdAt: 'desc' },
@@ -684,24 +729,30 @@ export class PlatformController {
   }
   @Get('replay-batches/:id')
   async replayBatch(@Param('id') batchId: string, @Req() req: AuthRequest) {
-    browserOnly(req);
+    requireScope(req, 'deliveries:replay');
     return replayBatchSummary(req.principal.organizationId, id(batchId));
   }
   @Get('stats')
   async stats(@Req() req: AuthRequest) {
-    browserOnly(req);
+    requireScope(req, 'events:read');
     const organizationId = req.principal.organizationId;
     const since = new Date(Date.now() - 86400000);
     const [events, endpoints, groups, performance, hourly] = await Promise.all([
-      db.event.count({ where: { organizationId, createdAt: { gte: since } } }),
+      db.event.count({
+        where: { organizationId, source: 'production', createdAt: { gte: since } },
+      }),
       db.endpoint.count({ where: { organizationId, enabled: true } }),
-      db.delivery.groupBy({ by: ['status'], where: { event: { organizationId } }, _count: true }),
+      db.delivery.groupBy({
+        by: ['status'],
+        where: { event: { organizationId, source: 'production' } },
+        _count: true,
+      }),
       db.$queryRaw<
         { p95: number | null; attempts: bigint }[]
-      >`SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY a."durationMs") AS p95, count(*) AS attempts FROM "Attempt" a JOIN "Delivery" d ON d.id = a."deliveryId" JOIN "Event" e ON e.id = d."eventId" WHERE e."organizationId" = ${organizationId} AND a."createdAt" >= ${since}`,
+      >`SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY a."durationMs") AS p95, count(*) AS attempts FROM "Attempt" a JOIN "Delivery" d ON d.id = a."deliveryId" JOIN "Event" e ON e.id = d."eventId" WHERE e."organizationId" = ${organizationId} AND e.source = 'production' AND a."createdAt" >= ${since}`,
       db.$queryRaw<
         { hour: Date; delivered: bigint; failed: bigint }[]
-      >`SELECT date_trunc('hour', a."createdAt") AS hour, count(*) FILTER (WHERE a.outcome = 'delivered') AS delivered, count(*) FILTER (WHERE a.outcome != 'delivered') AS failed FROM "Attempt" a JOIN "Delivery" d ON d.id = a."deliveryId" JOIN "Event" e ON e.id = d."eventId" WHERE e."organizationId" = ${organizationId} AND a."createdAt" >= ${since} GROUP BY 1 ORDER BY 1`,
+      >`SELECT date_trunc('hour', a."createdAt") AS hour, count(*) FILTER (WHERE a.outcome = 'delivered') AS delivered, count(*) FILTER (WHERE a.outcome != 'delivered') AS failed FROM "Attempt" a JOIN "Delivery" d ON d.id = a."deliveryId" JOIN "Event" e ON e.id = d."eventId" WHERE e."organizationId" = ${organizationId} AND e.source = 'production' AND a."createdAt" >= ${since} GROUP BY 1 ORDER BY 1`,
     ]);
     const counts = Object.fromEntries(groups.map((g) => [g.status, g._count]));
     return {
