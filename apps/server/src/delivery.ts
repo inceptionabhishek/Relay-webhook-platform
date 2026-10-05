@@ -75,6 +75,8 @@ async function runDelivery(job: DeliveryJob) {
       responseSnippet?: string;
       error?: string;
       outcome: string;
+      requestHeaders?: Record<string, string>;
+      requestBody?: string;
     },
   ) => {
     await db.$transaction(async (tx) => {
@@ -86,6 +88,7 @@ async function runDelivery(job: DeliveryJob) {
           failureCount: data.failureCount,
           attemptCount: data.attemptCount,
           deliveredAt: data.deliveredAt,
+          finishedAt: ['failed', 'delivered'].includes(data.status) ? new Date() : null,
           leaseUntil: null,
           leaseToken: null,
           ...(data.delay !== undefined
@@ -190,6 +193,8 @@ async function runDelivery(job: DeliveryJob) {
       'webhook-attempt': String(delivery.attemptCount + 1),
       'user-agent': 'Relay/0.1',
     };
+    if (delivery.event.source === 'test')
+      (headers as Record<string, string>)['webhook-test'] = 'true';
     const started = Date.now();
     let statusCode: number | undefined;
     let responseSnippet: string | undefined;
@@ -227,7 +232,14 @@ async function runDelivery(job: DeliveryJob) {
       statusCode === undefined && outcome === 'failed' ? 'cancelled' : outcome,
     );
     circuitFinished = true;
-    const attempt = { statusCode, responseSnippet, durationMs, error, outcome };
+    const attempt = {
+      statusCode,
+      responseSnippet,
+      durationMs,
+      error,
+      outcome,
+      ...(delivery.event.source === 'test' ? { requestHeaders: headers, requestBody: body } : {}),
+    };
     const attemptCount = delivery.attemptCount + 1;
     if (outcome === 'delivered') {
       await finalize(
