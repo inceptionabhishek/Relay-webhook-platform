@@ -28,7 +28,7 @@ Endpoint routing is selected at acceptance. Workers read the current URL, signin
 
 ## Dispatch and recovery
 
-The dispatcher reads due outbox rows using `FOR UPDATE SKIP LOCKED`. It chooses up to five rows per tenant and 50 per sweep. PostgreSQL row locks allow more than one dispatcher without simultaneously claiming the same rows.
+The dispatcher takes a transaction-scoped advisory lock for admission, then chooses the least recently served eligible tenant and one due outbox row per turn using `FOR UPDATE SKIP LOCKED`. It admits at most three incomplete queued/executing jobs per tenant and fifty globally by default. Persistent service timestamps interleave tenants across sweeps; row locks protect selected work. HTTP workers run independently of the admission lock.
 
 An outbox UUID is the BullMQ job ID. Enqueue happens before setting `dispatchedAt`. A Redis acknowledgement followed by a failed DB commit leaves the outbox eligible again; job-ID deduplication reduces duplicate queue entries.
 
@@ -40,13 +40,17 @@ Workers atomically claim a due delivery with its generation, an expiring lease, 
 
 An external receiver may still observe duplicates if a lease expires, a response is lost, or the database is unavailable after a successful request. Lease fencing protects local state, not external HTTP effects. Receivers must implement durable deduplication.
 
-HTTP attempt history and rescheduling/outbox insertion commit together. Tenant quota deferrals do not increment HTTP attempt counts. A 429 increments HTTP attempts but not counted failures. Replays increment generation, reset retry age/budget, retain historical attempts, and make old generation jobs harmless. Only terminal deliveries can be replayed.
+HTTP attempt history, scheduling-capacity release (`Outbox.completedAt`), and rescheduling/outbox insertion commit together. Reconciliation releases abandoned capacity. Paused circuit deliveries participate in recovery and backlog metrics. Durable bulk replay increments generations in bounded transactions and preserves attempt history.
+
+Tenant quota deferrals do not increment HTTP attempt counts. A 429 increments HTTP attempts but not counted failures. Replays increment generation, reset retry age/budget, retain historical attempts, and make old generation jobs harmless. Only terminal deliveries can be replayed.
 
 ## Quotas and fairness
 
 Redis Lua token buckets use Redis server time and execute refill/check/spend atomically. API limits are 30 requests/second with burst capacity 60 per workspace. Default delivery quota is 10/second per tenant. Redis sorted-set slots bound active outbound HTTP requests to three per tenant; slot expiry recovers a crashed worker.
 
-This improves tenant isolation at moderate load. A shared FIFO queue still permits backlog interference. Strict fairness would require tenant-aware scheduling/partitions, quotas at acceptance, and measurements of queue delay by tenant. Those are deliberate future extensions.
+Round-robin dispatch keeps most backlog in PostgreSQL and bounds how much any tenant can put in the shared FIFO queue. This provides equal turns and bounded admission, not weighted service or a latency SLA. Slow HTTP requests still occupy slots; large deployments may need scheduler partitions. The dispatch-delay histogram measures time past outbox due time, while per-tenant latency measurements remain a future extension.
+
+See [delivery operations](delivery-operations.md) for circuit admission/probe fencing, replay-batch snapshots, and scheduler configuration.
 
 ## Security
 

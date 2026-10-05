@@ -2,7 +2,7 @@
 
 Relay is a webhook delivery platform. Your backend publishes an event once; Relay sends it to subscribed HTTP endpoints, retries temporary failures, and keeps a history of every delivery attempt.
 
-The dashboard lets you manage endpoints and credentials, inspect payloads and responses, and replay deliveries after fixing a problem. The API, dispatcher, and delivery workers run as separate processes, with PostgreSQL as the durable store and Redis/BullMQ for background work.
+The dashboard lets you manage endpoints and credentials, inspect payloads and responses, and replay deliveries after fixing a problem. Endpoint circuit breakers pause unhealthy receivers, a failure inbox supports tracked bulk replay, and tenant-aware scheduling bounds each workspace's queued work. The API, dispatcher, and delivery workers run as separate processes, with PostgreSQL as the durable store and Redis/BullMQ for background work.
 
 ## Run locally
 
@@ -72,7 +72,7 @@ The developer registers with their name, email, password, and workspace name, su
 
 A new workspace starts empty. Its endpoints, events, deliveries, credentials, and audit records are isolated from other workspaces. Users can create additional workspaces and switch between those they belong to.
 
-The dashboard has views for the overview, events, endpoints, API keys, team, audit log, and documentation.
+The dashboard has views for the overview, events, failure inbox, endpoints, API keys, team, audit log, and documentation.
 
 ### 2. Add receiving endpoints
 
@@ -169,6 +169,10 @@ Suppose inventory and analytics return `200`, but shipping returns `503`. Relay 
 
 Once a delivery is terminal, the developer can replay it after fixing the receiver. The endpoint must be enabled. Replay starts a new delivery generation with a fresh retry budget and age limit, preserves previous attempts, and keeps the same event ID. It applies to the selected delivery, not every destination. Receivers must deduplicate replays too.
 
+For multiple failures, open **Failure inbox**, filter by event type or endpoint, select deliveries, and start a replay batch. Batches accept up to 500 failed deliveries and show queued, requeued, skipped, and current delivery outcomes. A completed batch has finished scheduling; its HTTP deliveries may still be running. Disabled endpoints or deliveries changed since submission are skipped with a reason.
+
+Endpoint cards show **closed**, **open**, or **half-open** circuit state. Repeated transient failures open the circuit and pause deliveries without spending HTTP attempts. After a cooldown, one delivery probes the receiver. Owners can request **Probe now** after fixing the service. Paused deliveries still have a maximum age.
+
 A `2xx` response confirms that the receiver acknowledged the webhook. It does not prove that downstream work, such as shipping an order, completed.
 
 ### 9. Operate the integration
@@ -221,14 +225,14 @@ Failed deliveries remain in PostgreSQL as the application's failure inbox. BullM
 
 - **Transactional outbox:** an accepted event and its delivery work commit together. Queue outages do not erase already accepted events.
 - **Recovery:** reconciliation recreates work for overdue deliveries after lost queue jobs or expired worker leases. Generation and lease-token checks prevent stale workers from overwriting newer results.
-- **Tenant limits:** Redis Lua scripts enforce shared publishing limits, delivery quotas, and outbound concurrency across replicas. Defaults are 30 publishing requests/second with a burst of 60, and 10 deliveries/second with three active outbound requests per workspace.
+- **Tenant scheduling:** the dispatcher serves the least recently served eligible workspace one job at a time, with three queued/executing jobs per workspace and fifty across the platform by default. Redis Lua scripts also enforce shared publishing limits, delivery quotas, and outbound concurrency across replicas. Defaults are 30 publishing requests/second with a burst of 60, and 10 deliveries/second with three active outbound requests per workspace.
 - **Credential storage:** passwords use salted scrypt; sessions and API keys are stored as hashes. Signing secrets use AES-256-GCM encryption. Browser sessions use HTTP-only cookies.
 - **Destination checks:** production requires HTTPS. DNS addresses are validated on every attempt and a validated address is pinned to the connection. Private and reserved destinations are blocked, with an explicit local-development allowlist.
 - **Bounded requests:** delivery requests have a deadline and response-size limit. Stored response previews are capped at 2,000 characters.
 
 Redis is also used for authentication/rate-limit checks. If it is unavailable, ingestion fails closed; previously accepted events remain durable and can resume delivery when dependencies recover.
 
-See [architecture](docs/architecture.md) for the concurrency model, failure windows, and guarantees.
+See [architecture](docs/architecture.md) for the concurrency model, failure windows, and guarantees. [Delivery operations](docs/delivery-operations.md) covers circuit breakers, bulk replay, scheduler admission, configuration, and upgrade steps.
 
 ## Try the failure scenarios
 
@@ -288,6 +292,6 @@ The [deployment guide](docs/deployment.md) describes an AWS deployment path. The
 
 ## Current limitations
 
-This is an initial version. Delivery ordering is not guaranteed, and receiver-side deduplication is required. Tenant limits and bounded dispatcher batches reduce interference, but the shared queue does not provide strict weighted fairness.
+This is an initial version. Delivery ordering is not guaranteed, and receiver-side deduplication is required. Tenant-aware round-robin dispatch and bounded queue admission reduce interference. They do not provide weighted service or a per-tenant latency SLA.
 
 Dashboard SSE reads PostgreSQL every two seconds and is intended for a modest number of users. Retention policies, password reset, billing, invitation email, automatic third-party integrations, and automated cloud provisioning are not implemented. Production SLOs and capacity limits have not been established. Local setup does not create AWS resources.
