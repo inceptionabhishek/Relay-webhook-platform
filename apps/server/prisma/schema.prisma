@@ -19,6 +19,9 @@ model Organization {
   id String @id @default(uuid())
   name String
   createdAt DateTime @default(now())
+  eventRetentionDays Int?
+  attemptRetentionDays Int?
+  retentionLastRunAt DateTime?
   lastScheduledAt DateTime @default(dbgenerated("'1970-01-01 00:00:00'::timestamp without time zone"))
   memberships Membership[]
   endpoints Endpoint[]
@@ -27,6 +30,10 @@ model Organization {
   invitations Invitation[]
   audits AuditLog[]
   replayBatches ReplayBatch[]
+  retentionRuns RetentionRun[]
+  expiredEvents ExpiredEvent[]
+  alertRules AlertRule[]
+  alerts Alert[]
 }
 model Membership {
   userId String
@@ -52,6 +59,10 @@ model ApiKey {
   tokenHash String @unique
   createdAt DateTime @default(now())
   revokedAt DateTime?
+  scopes String[] @default(["events:publish"])
+  eventTypes String[] @default([])
+  expiresAt DateTime?
+  lastUsedAt DateTime?
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   @@index([organizationId])
 }
@@ -69,6 +80,9 @@ model Endpoint {
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   deliveries Delivery[]
   circuitTransitions CircuitTransition[]
+  monitoredRules AlertRule[] @relation("MonitoredEndpoint")
+  notificationRules AlertRule[] @relation("NotificationEndpoint")
+  alerts Alert[]
   @@index([organizationId, createdAt])
 }
 model Event {
@@ -79,6 +93,8 @@ model Event {
   idempotencyKey String
   requestHash String
   traceContext Json @default("{}")
+  source String @default("production")
+  notifications AlertNotification[]
   createdAt DateTime @default(now())
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   deliveries Delivery[]
@@ -99,6 +115,7 @@ model Delivery {
   leaseToken String?
   lastError String?
   deliveredAt DateTime?
+  finishedAt DateTime?
   createdAt DateTime @default(now())
   event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
   endpoint Endpoint @relation(fields: [endpointId], references: [id])
@@ -119,6 +136,8 @@ model Attempt {
   responseSnippet String?
   error String?
   outcome String
+  requestHeaders Json?
+  requestBody String?
   createdAt DateTime @default(now())
   delivery Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
   @@index([deliveryId, createdAt])
@@ -162,14 +181,15 @@ model ReplayBatch {
 model ReplayItem {
   id String @id @default(uuid())
   batchId String
-  deliveryId String
+  deliveryId String?
+  originalDeliveryId String
   expectedGeneration Int
   replayGeneration Int?
   status String @default("queued")
   error String?
   batch ReplayBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
-  delivery Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
-  @@unique([batchId, deliveryId])
+  delivery Delivery? @relation(fields: [deliveryId], references: [id], onDelete: SetNull)
+  @@unique([batchId, originalDeliveryId])
   @@index([status, batchId])
 }
 model Invitation {
@@ -191,4 +211,69 @@ model AuditLog {
   createdAt DateTime @default(now())
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   @@index([organizationId, createdAt])
+}
+
+model ExpiredEvent {
+  id String @id @default(uuid())
+  organizationId String
+  eventId String @unique
+  idempotencyKey String
+  requestHash String
+  expiredAt DateTime @default(now())
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  @@unique([organizationId, idempotencyKey])
+}
+model RetentionRun {
+  id String @id @default(uuid())
+  organizationId String
+  eventsDeleted Int
+  attemptsDeleted Int
+  createdAt DateTime @default(now())
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  @@index([organizationId, createdAt])
+}
+model AlertRule {
+  id String @id @default(uuid())
+  organizationId String
+  name String
+  enabled Boolean @default(true)
+  endpointId String?
+  notificationEndpointId String?
+  threshold Int @default(3)
+  windowMinutes Int @default(15)
+  cooldownMinutes Int @default(30)
+  lastEvaluatedAt DateTime @default(dbgenerated("'1970-01-01 00:00:00'::timestamp without time zone"))
+  createdAt DateTime @default(now())
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  endpoint Endpoint? @relation("MonitoredEndpoint", fields: [endpointId], references: [id], onDelete: SetNull)
+  notificationEndpoint Endpoint? @relation("NotificationEndpoint", fields: [notificationEndpointId], references: [id], onDelete: SetNull)
+  alerts Alert[]
+  @@index([enabled, lastEvaluatedAt])
+}
+model Alert {
+  id String @id @default(uuid())
+  organizationId String
+  ruleId String
+  endpointId String
+  activeKey String? @unique
+  message String
+  failureCount Int
+  acknowledgedAt DateTime?
+  resolvedAt DateTime?
+  createdAt DateTime @default(now())
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  rule AlertRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  endpoint Endpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  notifications AlertNotification[]
+  @@index([organizationId, createdAt])
+}
+model AlertNotification {
+  id String @id @default(uuid())
+  alertId String
+  eventId String? @unique
+  phase String
+  createdAt DateTime @default(now())
+  alert Alert @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  event Event? @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  @@unique([alertId, phase])
 }
