@@ -1,4 +1,9 @@
-import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  NotFoundException,
+  GoneException,
+} from '@nestjs/common';
 import { db } from './db';
 import { hash } from './crypto';
 import type { Prisma } from './generated/prisma/client';
@@ -20,6 +25,7 @@ export async function resetDelivery(tx: Tx, deliveryId: string, generation: numb
       leaseUntil: null,
       leaseToken: null,
       deliveredAt: null,
+      finishedAt: null,
       lastError: null,
       createdAt: new Date(),
       outbox: { create: { generation, sequence: 0 } },
@@ -61,7 +67,11 @@ export async function createReplayBatch(
           idempotencyKey: key,
           requestHash,
           items: {
-            create: deliveries.map((d) => ({ deliveryId: d.id, expectedGeneration: d.generation })),
+            create: deliveries.map((d) => ({
+              deliveryId: d.id,
+              originalDeliveryId: d.id,
+              expectedGeneration: d.generation,
+            })),
           },
         },
       });
@@ -71,6 +81,8 @@ export async function createReplayBatch(
       return { id: batch.id };
     });
   } catch (err) {
+    if ((err as { code?: string }).code === 'P2003')
+      throw new GoneException('One or more deliveries expired under the retention policy');
     if ((err as { code?: string }).code === 'P2002') {
       const batch = await db.replayBatch.findUnique({
         where: { organizationId_idempotencyKey: { organizationId, idempotencyKey: key } },
@@ -86,12 +98,21 @@ export async function processReplayBatches() {
   const count = await db.$transaction(
     async (tx) => {
       const items = await tx.$queryRaw<
-        { id: string; batchId: string; deliveryId: string; expectedGeneration: number }[]
+        { id: string; batchId: string; deliveryId: string | null; expectedGeneration: number }[]
       >`
       SELECT i.* FROM "ReplayItem" i JOIN "ReplayBatch" b ON b.id = i."batchId"
       WHERE i.status = 'queued' ORDER BY b."createdAt", i.id LIMIT 25 FOR UPDATE OF i SKIP LOCKED`;
       // Consistent delivery lock order also supports overlapping replay batches.
-      for (const item of items.sort((a, b) => a.deliveryId.localeCompare(b.deliveryId))) {
+      for (const item of items.sort((a, b) =>
+        (a.deliveryId ?? '').localeCompare(b.deliveryId ?? ''),
+      )) {
+        if (!item.deliveryId) {
+          await tx.replayItem.update({
+            where: { id: item.id },
+            data: { status: 'skipped', error: 'Delivery expired' },
+          });
+          continue;
+        }
         await tx.$queryRaw`SELECT id FROM "Delivery" WHERE id = ${item.deliveryId} FOR UPDATE`;
         const delivery = await tx.delivery.findUniqueOrThrow({
           where: { id: item.deliveryId },
@@ -145,8 +166,11 @@ export async function replayBatchSummary(organizationId: string, batchId: string
   for (const item of batch.items) {
     counts[item.status as keyof typeof counts]++;
     if (item.status === 'replayed') {
-      const status =
-        item.delivery.generation === item.replayGeneration ? item.delivery.status : 'superseded';
+      const status = !item.delivery
+        ? 'expired'
+        : item.delivery.generation === item.replayGeneration
+          ? item.delivery.status
+          : 'superseded';
       outcomes[status] = (outcomes[status] ?? 0) + 1;
     }
   }
@@ -160,8 +184,10 @@ export async function replayBatchSummary(organizationId: string, batchId: string
     outcomes,
     items: batch.items.map(({ delivery, ...item }) => ({
       ...item,
-      deliveryStatus:
-        item.replayGeneration !== null && delivery.generation !== item.replayGeneration
+      deliveryId: item.originalDeliveryId,
+      deliveryStatus: !delivery
+        ? 'expired'
+        : item.replayGeneration !== null && delivery.generation !== item.replayGeneration
           ? 'superseded'
           : delivery.status,
     })),
