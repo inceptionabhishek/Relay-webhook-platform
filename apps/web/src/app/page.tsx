@@ -37,6 +37,11 @@ import {
 } from 'recharts';
 import { Button, Modal, Badge } from '@/components/ui';
 import { FailureInbox, EndpointCircuit } from '@/components/delivery-operations';
+import {
+  RetentionSettings,
+  AlertsConsole,
+  WebhookTesting,
+} from '@/components/workspace-operations';
 import { API, api, time, type Endpoint, type Event, type Stats } from '@/lib/api';
 type View =
   | 'Overview'
@@ -46,7 +51,10 @@ type View =
   | 'API keys'
   | 'Team'
   | 'Audit log'
-  | 'Documentation';
+  | 'Documentation'
+  | 'Alerts'
+  | 'Testing'
+  | 'Settings';
 type Me = {
   name: string;
   email: string;
@@ -57,6 +65,9 @@ const nav = [
   { name: 'Events', icon: Activity },
   { name: 'Failure inbox', icon: Bell },
   { name: 'Endpoints', icon: Webhook },
+  { name: 'Alerts', icon: Bell },
+  { name: 'Testing', icon: Code2 },
+  { name: 'Settings', icon: ShieldCheck },
   { name: 'API keys', icon: KeyRound },
   { name: 'Team', icon: Users },
   { name: 'Audit log', icon: ShieldCheck },
@@ -338,7 +349,8 @@ function Dashboard({ me }: { me: Me }) {
   }
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    const data = Object.fromEntries(new FormData(e.currentTarget));
+    const form = new FormData(e.currentTarget);
+    const data = Object.fromEntries(form);
     const result = await action(async () => {
       if (modal === 'endpoint' || modal === 'edit-endpoint')
         return api(
@@ -369,7 +381,18 @@ function Dashboard({ me }: { me: Me }) {
           { 'Idempotency-Key': String(data.idempotencyKey) },
         );
       }
-      if (modal === 'key') return api('/keys', org, 'POST', { name: data.name });
+      if (modal === 'key')
+        return api('/keys', org, 'POST', {
+          name: data.name,
+          scopes: form.getAll('scopes'),
+          eventTypes: String(data.keyEventTypes ?? '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean),
+          expiresAt: data.expiryDays
+            ? new Date(Date.now() + Number(data.expiryDays) * 86400000).toISOString()
+            : null,
+        });
       if (modal === 'workspace')
         return api('/auth/workspaces', undefined, 'POST', { name: data.name });
       if (modal === 'invite') return api('/invitations', org, 'POST', { email: data.email });
@@ -432,6 +455,9 @@ function Dashboard({ me }: { me: Me }) {
                     onClick={() => setEventId(e.id)}
                   >
                     {e.type}
+                    {e.source && e.source !== 'production' && (
+                      <span className="ml-2 text-xs text-violet-600">{e.source}</span>
+                    )}
                     <span className="mono mt-1 block text-[10px] text-slate-400">
                       {e.id.slice(0, 18)}…
                     </span>
@@ -589,7 +615,10 @@ function Dashboard({ me }: { me: Me }) {
                     Events: 'Inspect payloads, trace attempts, and replay deliveries.',
                     'Failure inbox': 'Find failed deliveries and track recovery in batches.',
                     Endpoints: 'Connect your services and control where events go.',
-                    'API keys': 'Manage credentials for publishing events to your workspace.',
+                    Alerts: 'Configure failure notifications and track endpoint incidents.',
+                    Testing: 'Send sample webhooks and verify receiver signatures.',
+                    Settings: 'Control data retention and inspect cleanup history.',
+                    'API keys': 'Manage scoped credentials, event restrictions, and expiry.',
                     Team: 'Collaborate with your team across one workspace.',
                     'Audit log': 'A history of changes and actions in this workspace.',
                     Documentation: 'Everything you need to connect your first integration.',
@@ -597,29 +626,31 @@ function Dashboard({ me }: { me: Me }) {
                 }
               </p>
             </div>
-            <Button
-              onClick={() =>
-                setModal(
-                  view === 'Endpoints'
-                    ? 'endpoint'
-                    : view === 'API keys'
-                      ? 'key'
-                      : view === 'Team'
-                        ? 'invite'
-                        : 'event',
-                )
-              }
-              disabled={(['Endpoints', 'API keys', 'Team'] as string[]).includes(view) && !owner}
-            >
-              {view === 'Endpoints' ? <Plus size={15} /> : <Send size={14} />}
-              {view === 'Endpoints'
-                ? 'Add endpoint'
-                : view === 'API keys'
-                  ? 'Create API key'
-                  : view === 'Team'
-                    ? 'Invite member'
-                    : 'Publish event'}
-            </Button>
+            {!(['Alerts', 'Testing', 'Settings'] as string[]).includes(view) && (
+              <Button
+                onClick={() =>
+                  setModal(
+                    view === 'Endpoints'
+                      ? 'endpoint'
+                      : view === 'API keys'
+                        ? 'key'
+                        : view === 'Team'
+                          ? 'invite'
+                          : 'event',
+                  )
+                }
+                disabled={(['Endpoints', 'API keys', 'Team'] as string[]).includes(view) && !owner}
+              >
+                {view === 'Endpoints' ? <Plus size={15} /> : <Send size={14} />}
+                {view === 'Endpoints'
+                  ? 'Add endpoint'
+                  : view === 'API keys'
+                    ? 'Create API key'
+                    : view === 'Team'
+                      ? 'Invite member'
+                      : 'Publish event'}
+              </Button>
+            )}
           </div>
           {(error || queryError) && (
             <div
@@ -942,6 +973,13 @@ function Dashboard({ me }: { me: Me }) {
               )}
             </div>
           )}
+          {view === 'Settings' && <RetentionSettings key={org} org={org} owner={owner} />}
+          {view === 'Alerts' && (
+            <AlertsConsole key={org} org={org} owner={owner} endpoints={endpoints.data ?? []} />
+          )}
+          {view === 'Testing' && (
+            <WebhookTesting key={org} org={org} endpoints={endpoints.data ?? []} />
+          )}
           {view === 'API keys' && (
             <section className="card overflow-hidden">
               {!owner ? (
@@ -965,16 +1003,41 @@ function Dashboard({ me }: { me: Me }) {
                     <tbody>
                       {keys.data?.map((key) => (
                         <tr key={key.id}>
-                          <td>{key.name}</td>
+                          <td>
+                            {key.name}
+                            <p className="mt-1 text-xs text-slate-500">{key.scopes?.join(', ')}</p>
+                            <p className="mt-1 text-xs text-slate-400">
+                              {key.eventTypes?.length
+                                ? key.eventTypes.join(', ')
+                                : 'All event types'}
+                            </p>
+                          </td>
                           <td className="mono">{key.prefix}…</td>
-                          <td>{time(key.createdAt)}</td>
-                          <td>{key.revokedAt ? 'Revoked' : 'Active · publish only'}</td>
+                          <td>
+                            {time(key.createdAt)}
+                            <p className="mt-1 text-xs text-slate-400">
+                              {key.expiresAt ? `Expires ${time(key.expiresAt)}` : 'No expiry'}
+                            </p>
+                            <p className="mt-1 text-xs text-slate-400">
+                              {key.lastUsedAt ? `Used ${time(key.lastUsedAt)}` : 'Never used'}
+                            </p>
+                          </td>
+                          <td>
+                            {key.revokedAt
+                              ? 'Revoked'
+                              : key.expiresAt && new Date(key.expiresAt) <= new Date()
+                                ? 'Expired'
+                                : 'Active'}
+                          </td>
                           <td className="space-x-2">
                             {!key.revokedAt && (
                               <>
                                 <Button
                                   variant="secondary"
-                                  disabled={busy}
+                                  disabled={
+                                    busy ||
+                                    (!!key.expiresAt && new Date(key.expiresAt) <= new Date())
+                                  }
                                   onClick={() =>
                                     void action(async () => {
                                       const result = await api(
@@ -1082,8 +1145,9 @@ function Dashboard({ me }: { me: Me }) {
             <section className="card max-w-4xl p-7">
               <h2 className="text-xl font-semibold">Publish your first event</h2>
               <p className="mt-3 leading-6 text-slate-500">
-                Create an endpoint and API key, then send a request with a unique idempotency key.
-                Repeating the same request with the same key returns the original event.
+                Create an endpoint and an API key with events:publish, then send a request with a
+                unique idempotency key. Repeating the same request with the same key returns the
+                original event.
               </p>
               <Code
                 text={`curl ${API}/events \\\n  -H 'Authorization: Bearer YOUR_API_KEY' \\\n  -H 'Idempotency-Key: order-123-created' \\\n  -H 'Content-Type: application/json' \\\n  -d '{"type":"order.created","payload":{"orderId":"123","amount":2499}}'`}
@@ -1104,6 +1168,15 @@ function Dashboard({ me }: { me: Me }) {
                 <code className="mono">webhook-id</code>. Return a 2xx response after safely
                 recording the event. Responses of 429 defer delivery without consuming its failure
                 budget; temporary failures retry with backoff. Redirects are rejected.
+              </p>
+              <h2 className="mt-7 font-semibold">Test and operate your integration</h2>
+              <p className="mt-2 leading-6 text-slate-500">
+                Testing sends signed requests to one endpoint and verifies captured signatures.
+                Handle webhook-test: true in your receiver before using test traffic. Alerts track
+                production failures and can send signed notifications to a separate endpoint.
+                Settings controls optional retention; expired events return 410 on a matching
+                publish retry. Give each API key only the scopes it needs, with an optional
+                event-type allowlist and expiry.
               </p>
               <a
                 href={`${API}/docs`}
@@ -1190,6 +1263,53 @@ function Dashboard({ me }: { me: Me }) {
                 className="field"
                 placeholder="Leave empty to receive all events"
               />
+            </>
+          )}
+          {modal === 'key' && (
+            <>
+              <fieldset className="mt-5">
+                <legend className="label">Permissions</legend>
+                {[
+                  'events:publish',
+                  'events:read',
+                  'endpoints:read',
+                  'deliveries:replay',
+                  'testing:write',
+                ].map((scope) => (
+                  <label key={scope} className="mt-2 flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      name="scopes"
+                      value={scope}
+                      defaultChecked={scope === 'events:publish'}
+                    />
+                    {scope}
+                  </label>
+                ))}
+              </fieldset>
+              <label className="label" htmlFor="key-event-types">
+                Allowed event types (comma separated)
+              </label>
+              <input
+                id="key-event-types"
+                name="keyEventTypes"
+                className="field"
+                placeholder="Leave empty to allow all event types"
+              />
+              <label className="label" htmlFor="key-expiry">
+                Key expiry
+              </label>
+              <select id="key-expiry" name="expiryDays" className="field" defaultValue="90">
+                <option value="7">7 days</option>
+                <option value="30">30 days</option>
+                <option value="90">90 days</option>
+                <option value="365">365 days</option>
+                <option value="">No expiry</option>
+              </select>
+              <p className="mt-3 text-xs text-slate-500">
+                Event-type restrictions apply to publishing and test requests. Rotation preserves
+                permissions, restrictions, and expiry.
+              </p>
             </>
           )}
           {modal === 'event' && (

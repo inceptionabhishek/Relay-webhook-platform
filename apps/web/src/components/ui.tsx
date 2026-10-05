@@ -83,6 +83,9 @@ export function Badge({ status }: { status: string }) {
     paused: 'bg-orange-50 text-orange-700',
     skipped: 'bg-amber-50 text-amber-700',
     replayed: 'bg-blue-50 text-blue-600',
+    open: 'bg-red-50 text-red-600',
+    resolved: 'bg-emerald-50 text-emerald-700',
+    expired: 'bg-slate-100 text-slate-500',
     pending: 'bg-slate-100 text-slate-600',
     processing: 'bg-blue-50 text-blue-600',
   };

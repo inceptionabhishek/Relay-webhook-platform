@@ -48,7 +48,7 @@ export type Delivery = {
   generation: number;
   nextAttemptAt: string;
   lastError?: string;
-  endpoint: { name: string; url: string };
+  endpoint: { id?: string; name: string; url: string };
   attempts?: {
     id: string;
     number: number;
@@ -58,10 +58,13 @@ export type Delivery = {
     error?: string;
     responseSnippet?: string;
     outcome: string;
+    requestHeaders?: Record<string, string>;
+    requestBody?: string;
     createdAt: string;
   }[];
 };
 export type Event = {
+  source?: 'production' | 'test' | 'alert';
   id: string;
   type: string;
   payload: unknown;
