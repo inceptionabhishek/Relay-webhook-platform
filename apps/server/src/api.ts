@@ -18,6 +18,7 @@ import {
   UnauthorizedException,
   ServiceUnavailableException,
   HttpException,
+  HttpCode,
 } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiHeader, ApiBody, ApiOperation } from '@nestjs/swagger';
 import type { Request, Response } from 'express';
@@ -32,6 +33,7 @@ import { config } from './config';
 import { resolveDestination } from './destination';
 import { rateLimit } from './queue';
 import { circuitStates, requestProbe } from './circuit';
+import { createReplayBatch, replayBatchSummary, resetDelivery } from './replay';
 const email = z
   .string()
   .email()
@@ -584,22 +586,7 @@ export class PlatformController {
       if (!delivery.endpoint.enabled)
         throw new BadRequestException('Enable the endpoint before replaying');
       const generation = delivery.generation + 1;
-      await tx.delivery.update({
-        where: { id: deliveryId },
-        data: {
-          generation,
-          failureCount: 0,
-          scheduleCount: 0,
-          status: 'pending',
-          nextAttemptAt: new Date(),
-          leaseUntil: null,
-          leaseToken: null,
-          deliveredAt: null,
-          lastError: null,
-          createdAt: new Date(),
-          outbox: { create: { generation, sequence: 0 } },
-        },
-      });
+      await resetDelivery(tx, deliveryId, generation);
       await tx.auditLog.create({
         data: {
           organizationId: req.principal.organizationId,
@@ -610,6 +597,95 @@ export class PlatformController {
       });
       return { ok: true, generation };
     });
+  }
+  @Get('failures')
+  @ApiOperation({ summary: 'List failed deliveries with endpoint and event filters' })
+  async failures(@Req() req: AuthRequest, @Query() query: Record<string, string>) {
+    browserOnly(req);
+    const limit = z.coerce.number().int().min(1).max(100).default(25).parse(query.limit);
+    const endpointId = query.endpointId ? id(query.endpointId) : undefined;
+    const cursor = query.cursor ? id(query.cursor) : undefined;
+    if (
+      cursor &&
+      !(await db.delivery.findFirst({
+        where: { id: cursor, event: { organizationId: req.principal.organizationId } },
+      }))
+    )
+      throw new BadRequestException('Invalid cursor');
+    const where = {
+      status: 'failed',
+      ...(endpointId ? { endpointId } : {}),
+      event: {
+        organizationId: req.principal.organizationId,
+        ...(query.search
+          ? { type: { contains: query.search.slice(0, 100), mode: 'insensitive' as const } }
+          : {}),
+      },
+    };
+    const [total, rows] = await Promise.all([
+      db.delivery.count({ where }),
+      db.delivery.findMany({
+        where,
+        take: limit + 1,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        include: {
+          endpoint: { select: { id: true, name: true, url: true, enabled: true } },
+          event: { select: { id: true, type: true, createdAt: true } },
+        },
+      }),
+    ]);
+    return {
+      total,
+      items: rows.slice(0, limit),
+      nextCursor: rows.length > limit ? rows[limit - 1].id : null,
+    };
+  }
+  @Post('replay-batches')
+  @HttpCode(202)
+  @ApiHeader({ name: 'Idempotency-Key', required: true })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['deliveryIds'],
+      properties: {
+        deliveryIds: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 500,
+          items: { type: 'string', format: 'uuid' },
+        },
+      },
+    },
+  })
+  async bulkReplay(@Req() req: AuthRequest, @Body() body: unknown) {
+    browserOnly(req);
+    const { deliveryIds } = z
+      .object({ deliveryIds: z.array(z.string().uuid()).min(1).max(500) })
+      .parse(body);
+    const key = z.string().min(1).max(200).parse(req.headers['idempotency-key']);
+    const result = await createReplayBatch(
+      req.principal.organizationId,
+      req.principal.actor,
+      key,
+      deliveryIds,
+    );
+    return replayBatchSummary(req.principal.organizationId, result.id);
+  }
+  @Get('replay-batches')
+  async replayBatches(@Req() req: AuthRequest) {
+    browserOnly(req);
+    const batches = await db.replayBatch.findMany({
+      where: { organizationId: req.principal.organizationId },
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+    });
+    return Promise.all(batches.map((b) => replayBatchSummary(req.principal.organizationId, b.id)));
+  }
+  @Get('replay-batches/:id')
+  async replayBatch(@Param('id') batchId: string, @Req() req: AuthRequest) {
+    browserOnly(req);
+    return replayBatchSummary(req.principal.organizationId, id(batchId));
   }
   @Get('stats')
   async stats(@Req() req: AuthRequest) {

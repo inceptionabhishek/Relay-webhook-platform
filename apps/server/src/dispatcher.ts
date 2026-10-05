@@ -1,6 +1,7 @@
 import './telemetry';
 import { createServer } from 'node:http';
 import { dispatchBatch, reconcile } from './outbox';
+import { processReplayBatches } from './replay';
 import { logger, registry } from './observability';
 import { db } from './db';
 import { redis, deliveryQueue } from './queue';
@@ -20,6 +21,7 @@ void (async () => {
   logger.info('Outbox dispatcher ready');
   while (running) {
     try {
+      await processReplayBatches();
       await dispatchBatch();
       if (ticks++ % 20 === 0) await reconcile();
     } catch (err) {

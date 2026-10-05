@@ -491,3 +491,142 @@ test('paused circuit deliveries still expire at the maximum delivery age', async
   expect(expired.attemptCount).toBe(0);
   expect(expired.lastError).toContain('maximum retry age');
 });
+test('failure inbox filters deliveries; durable idempotent batches preserve attempts and report skips', async () => {
+  const { processReplayBatches } = await import('../src/replay');
+  const { endpoint, deliveries } = await endpointEvents('reject', 3);
+  for (const delivery of deliveries)
+    await processDelivery({ deliveryId: delivery.id, generation: 0 });
+  const inbox = await auth('get', `/failures?endpointId=${endpoint.id}&search=operations&limit=2`);
+  expect(inbox.body.total).toBe(3);
+  expect(inbox.body.items).toHaveLength(2);
+  expect(inbox.body.nextCursor).toBeTruthy();
+  const second = await auth(
+    'get',
+    `/failures?endpointId=${endpoint.id}&limit=2&cursor=${inbox.body.nextCursor}`,
+  );
+  expect(second.body.items).toHaveLength(1);
+  const key = randomUUID();
+  const ids = deliveries.map((d) => d.id);
+  const batches = await Promise.all(
+    Array.from({ length: 3 }, () =>
+      auth('post', '/replay-batches').set('Idempotency-Key', key).send({ deliveryIds: ids }),
+    ),
+  );
+  batches.forEach((b) => expect(b.status).toBe(202));
+  expect(new Set(batches.map((b) => b.body.id)).size).toBe(1);
+  const batchId = batches[0].body.id;
+  expect(
+    (
+      await auth('post', '/replay-batches')
+        .set('Idempotency-Key', key)
+        .send({ deliveryIds: ids.slice(0, 1) })
+    ).status,
+  ).toBe(409);
+  // A single replay after batch acceptance makes that snapshot item stale.
+  await auth('post', `/deliveries/${ids[0]}/replay`).send({});
+  await auth('patch', `/endpoints/${endpoint.id}`).send({ url: `${receiverUrl}/success` });
+  await Promise.all([processReplayBatches(), processReplayBatches()]);
+  const progress = await auth('get', `/replay-batches/${batchId}`);
+  expect(progress.body.status).toBe('completed');
+  expect(progress.body.replayed).toBe(2);
+  expect(progress.body.skipped).toBe(1);
+  expect(progress.body.items.some((i: any) => i.error?.includes('changed'))).toBe(true);
+  for (const delivery of deliveries) {
+    await processDelivery({ deliveryId: delivery.id, generation: 0 }); // stale generation is ignored
+    await processDelivery({ deliveryId: delivery.id, generation: 1 });
+    expect(await db.attempt.count({ where: { deliveryId: delivery.id } })).toBe(2);
+  }
+  expect((await auth('get', `/replay-batches/${batchId}`)).body.outcomes.delivered).toBe(2);
+  expect((await auth('get', '/failures')).body.total).toBe(0);
+  expect(
+    (await auth('post', '/replay-batches').set('Idempotency-Key', key).send({ deliveryIds: ids }))
+      .body.id,
+  ).toBe(batchId);
+  await freshWorkspace();
+  expect((await auth('get', `/replay-batches/${batchId}`)).status).toBe(404);
+  expect(
+    (
+      await auth('post', '/replay-batches')
+        .set('Idempotency-Key', randomUUID())
+        .send({ deliveryIds: ids })
+    ).status,
+  ).toBe(404);
+  expect((await auth('get', '/failures')).body.total).toBe(0);
+});
+test('bulk replay skips disabled endpoints and rejects active deliveries and oversized requests', async () => {
+  const { processReplayBatches } = await import('../src/replay');
+  const { endpoint, deliveries } = await endpointEvents('reject', 2);
+  expect(
+    (
+      await auth('post', '/replay-batches')
+        .set('Idempotency-Key', randomUUID())
+        .send({ deliveryIds: [deliveries[0].id] })
+    ).status,
+  ).toBe(400);
+  for (const delivery of deliveries)
+    await processDelivery({ deliveryId: delivery.id, generation: 0 });
+  const batch = await auth('post', '/replay-batches')
+    .set('Idempotency-Key', randomUUID())
+    .send({ deliveryIds: deliveries.map((d) => d.id) });
+  await auth('patch', `/endpoints/${endpoint.id}`).send({ enabled: false });
+  await processReplayBatches();
+  const progress = await auth('get', `/replay-batches/${batch.body.id}`);
+  expect(progress.body.skipped).toBe(2);
+  expect(progress.body.items.every((i: any) => i.error === 'Endpoint disabled')).toBe(true);
+  expect(
+    (
+      await auth('post', '/replay-batches')
+        .set('Idempotency-Key', randomUUID())
+        .send({ deliveryIds: Array.from({ length: 501 }, () => deliveries[0].id) })
+    ).status,
+  ).toBe(400);
+});
+
+test('bulk replay runs in bounded durable chunks and resumes remaining items', async () => {
+  const { processReplayBatches } = await import('../src/replay');
+  const { endpoint } = await endpointEvents('success', 0);
+  const ids: string[] = [];
+  for (let i = 0; i < 30; i++) {
+    const event = await db.event.create({
+      data: {
+        organizationId: org,
+        type: 'chunk',
+        payload: {},
+        idempotencyKey: randomUUID(),
+        requestHash: 'test',
+        deliveries: {
+          create: { endpointId: endpoint.id, status: 'failed', lastError: 'Old outage' },
+        },
+      },
+      include: { deliveries: true },
+    });
+    ids.push(event.deliveries[0].id);
+  }
+  const batch = await auth('post', '/replay-batches')
+    .set('Idempotency-Key', randomUUID())
+    .send({ deliveryIds: ids });
+  expect(batch.status).toBe(202);
+  expect(await processReplayBatches()).toBe(25);
+  expect((await auth('get', `/replay-batches/${batch.body.id}`)).body.queued).toBe(5);
+  expect(await processReplayBatches()).toBe(5);
+  const progress = await auth('get', `/replay-batches/${batch.body.id}`);
+  expect(progress.body.replayed).toBe(30);
+  expect(progress.body.completedAt).not.toBeNull();
+  const key = await auth('post', '/keys').send({ name: 'publisher' });
+  expect(
+    (
+      await request(app.getHttpServer())
+        .get('/failures')
+        .set('Authorization', `Bearer ${key.body.secret}`)
+    ).status,
+  ).toBe(403);
+  expect(
+    (
+      await request(app.getHttpServer())
+        .post('/replay-batches')
+        .set('Authorization', `Bearer ${key.body.secret}`)
+        .set('Idempotency-Key', randomUUID())
+        .send({ deliveryIds: ids })
+    ).status,
+  ).toBe(403);
+});
