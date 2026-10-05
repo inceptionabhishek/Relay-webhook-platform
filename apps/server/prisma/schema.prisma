@@ -19,12 +19,14 @@ model Organization {
   id String @id @default(uuid())
   name String
   createdAt DateTime @default(now())
+  lastScheduledAt DateTime @default(dbgenerated("'1970-01-01 00:00:00'::timestamp without time zone"))
   memberships Membership[]
   endpoints Endpoint[]
   keys ApiKey[]
   events Event[]
   invitations Invitation[]
   audits AuditLog[]
+  replayBatches ReplayBatch[]
 }
 model Membership {
   userId String
@@ -66,6 +68,7 @@ model Endpoint {
   createdAt DateTime @default(now())
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   deliveries Delivery[]
+  circuitTransitions CircuitTransition[]
   @@index([organizationId, createdAt])
 }
 model Event {
@@ -101,8 +104,10 @@ model Delivery {
   endpoint Endpoint @relation(fields: [endpointId], references: [id])
   attempts Attempt[]
   outbox Outbox[]
+  replayItems ReplayItem[]
   @@unique([eventId, endpointId])
   @@index([status, nextAttemptAt])
+  @@index([endpointId, status, nextAttemptAt])
 }
 model Attempt {
   id String @id @default(uuid())
@@ -125,10 +130,47 @@ model Outbox {
   sequence Int @default(0)
   availableAt DateTime @default(now())
   dispatchedAt DateTime?
+  completedAt DateTime?
   createdAt DateTime @default(now())
   delivery Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
   @@unique([deliveryId, generation, sequence])
   @@index([dispatchedAt, availableAt])
+}
+model CircuitTransition {
+  id String @id @default(uuid())
+  endpointId String
+  fromState String
+  toState String
+  reason String
+  createdAt DateTime @default(now())
+  endpoint Endpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  @@index([endpointId, createdAt])
+}
+model ReplayBatch {
+  id String @id @default(uuid())
+  organizationId String
+  actor String
+  idempotencyKey String
+  requestHash String
+  createdAt DateTime @default(now())
+  completedAt DateTime?
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  items ReplayItem[]
+  @@unique([organizationId, idempotencyKey])
+  @@index([organizationId, createdAt])
+}
+model ReplayItem {
+  id String @id @default(uuid())
+  batchId String
+  deliveryId String
+  expectedGeneration Int
+  replayGeneration Int?
+  status String @default("queued")
+  error String?
+  batch ReplayBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  delivery Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  @@unique([batchId, deliveryId])
+  @@index([status, batchId])
 }
 model Invitation {
   id String @id @default(uuid())

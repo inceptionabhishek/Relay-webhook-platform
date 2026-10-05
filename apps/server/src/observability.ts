@@ -36,3 +36,16 @@ export const oldest = new Gauge({
   help: 'Age of oldest outstanding delivery',
   registers: [registry],
 });
+
+export const circuitTransitions = new Counter({
+  name: 'relay_circuit_transitions_total',
+  help: 'Endpoint circuit transitions and probe requests',
+  labelNames: ['state'],
+  registers: [registry],
+});
+export const scheduleDelay = new Histogram({
+  name: 'relay_dispatch_delay_seconds',
+  help: 'Time past outbox due time before fair dispatch',
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 300],
+  registers: [registry],
+});
